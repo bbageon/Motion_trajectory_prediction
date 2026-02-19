@@ -1,0 +1,9 @@
+huggingface_hub
+transformers
+peft
+accelerate
+torch
+matplotlib
+numpy
+opencv-python
+mediapipe==0.10.32
