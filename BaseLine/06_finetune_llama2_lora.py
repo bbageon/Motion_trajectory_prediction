@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import random
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -226,7 +227,7 @@ def build_trainer(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LoRA finetuning for local Llama2 on motion JSONL.")
-    parser.add_argument("--base-model-dir", default="./llama2_local_tokenizerExtension")
+    parser.add_argument("--base-model-dir", default="../Meta-Llama-3.1-8B_tokenizerExtension")
     parser.add_argument("--train-jsonl", default="./finetune_dataset_delta.jsonl")
     parser.add_argument("--output-dir", default="")
     # --max-length는 "한 샘플(프롬프트+정답+EOS)"의 최대 토큰 길이.
@@ -247,6 +248,15 @@ def main() -> None:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     args = parser.parse_args()
 
+    script_dir = Path(__file__).resolve().parent
+    # 상대경로 인자는 현재 작업 디렉토리가 아니라 스크립트 위치 기준으로 해석한다.
+    args.base_model_dir = str((script_dir / args.base_model_dir).resolve()) if not os.path.isabs(args.base_model_dir) else args.base_model_dir
+    args.train_jsonl = str((script_dir / args.train_jsonl).resolve()) if not os.path.isabs(args.train_jsonl) else args.train_jsonl
+    if args.output_dir and not os.path.isabs(args.output_dir):
+        args.output_dir = str((script_dir / args.output_dir).resolve())
+
+    if not os.path.exists(args.base_model_dir):
+        raise FileNotFoundError(f"base model dir not found: {args.base_model_dir}")
     if not os.path.exists(args.train_jsonl):
         raise FileNotFoundError(f"train jsonl not found: {args.train_jsonl}")
 

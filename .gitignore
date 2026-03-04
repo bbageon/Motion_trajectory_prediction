@@ -5,3 +5,48 @@ motionQA_finetuned_lora_mps/
 *.json
 
 /운동데이터
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local model/download artifacts (large)
+Meta-Llama-3.1-8B/
+Meta-Llama-3.1-8B-Instruct/
+Llama-2-7b-chat-hf/
+Llama-2-13b-chat-hf/
+Llama-2-70b-chat-hf/
+*_tokenizerExtension/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# Dataset/media artifacts (large)
+*.jsonl
+*.mp4
+*.gif
