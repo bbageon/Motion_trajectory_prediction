@@ -16,8 +16,8 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 # ----------------------------
 # 1️⃣ 모델 & 토크나이저 로드
 # ----------------------------
-base_model_dir = "./llama2_local_tokenizerExtension"
-lora_model_dir = "./motionQA_delta_finetuned_lora_mps" ## Finetuning 한 모델을 써야함
+base_model_dir = "../Meta-Llama-3.1-8B_tokenizerExtension"
+lora_model_dir = "../BaseLine/motionQA_delta_finetuned_lora_mps" ## MPS에서 파인튜닝한 모델
 
 print("🔹 Loading model...")
 tokenizer = AutoTokenizer.from_pretrained(base_model_dir, local_files_only=True)
@@ -35,7 +35,7 @@ print("✅ Model + LoRA Adapter Loaded Successfully!")
 # 2️⃣ 프롬프트 생성
 # ----------------------------
 # 여기서 MP4 파일을 Json 파일로 변환한 델타 데이터를 삽입
-pose_json_path = "./Custom_Data/raise_arm2.json"
+pose_json_path = "../dataset/armRaise/IMG_8646.json"
 test_prompt = create_prompt_from_pose(pose_json_path)
 
 print("\n🧩 [Generated Test Prompt Preview]")
@@ -49,13 +49,15 @@ inputs = tokenizer(test_prompt, return_tensors="pt").to(device)
 with torch.no_grad():
     outputs = model.generate(
         **inputs,
-        max_new_tokens=300,
+        max_new_tokens=15000,
         temperature=0.4,
         top_p=0.9,
         do_sample=True,
     )
 
-generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+input_len = inputs["input_ids"].shape[1]
+new_token_ids = outputs[0][input_len:]
+generated_text = tokenizer.decode(new_token_ids, skip_special_tokens=False)
 print("\n🧠 [Model Raw Output]\n", generated_text[:1000])
 
 
@@ -63,41 +65,57 @@ print("\n🧠 [Model Raw Output]\n", generated_text[:1000])
 # 4️⃣ delta 토큰 → float 변환
 # ----------------------------
 def decode_token_number(token_str: str):
-    # 토큰 문자열에서 수치를 추출한다.
-    # 기대 포맷: [NUM]-?[DEC]iii[SEP][DEC]ddd[ENDNUM]
-    pattern = r"\[NUM\](-?)(?:\[DEC\])?(\d{3})\[SEP\]\[DEC\](\d{3})\[ENDNUM\]"
+    # 학습 포맷: {sign}[NUM][INT]{int}[SEP][DEC]{dec}[ENDNUM]
+    # 부호가 [NUM] 앞에 위치, 정수부는 [INT] 토큰 사용
+    pattern = r"(-?)\[NUM\]\[INT\](\d{3})\[SEP\]\[DEC\](\d{3})\[ENDNUM\]"
     m = re.search(pattern, token_str)
     if not m:
         raise ValueError(f"Invalid token format: {token_str}")
     sign = -1 if m.group(1) == "-" else 1
     int_part = int(m.group(2))
     dec_part = int(m.group(3))
-    v = round(sign * (int_part + dec_part / 1000), 4)
-    return v
+    return round(sign * (int_part + dec_part / 1000), 4)
 
 
 # ----------------------------
 # 5️⃣ LLM 출력 → joint별 delta 수집
 # ----------------------------
 def parse_predicted_deltas(llm_output: str):
-    # LLM 출력 텍스트에서
-    # JOINT:(x_token,y_token) 패턴을 모두 수집한다.
-    pattern = r"([A-Z_]+):\(\s*(\[NUM\].*?\[ENDNUM\])\s*,\s*(\[NUM\].*?\[ENDNUM\])\s*\)"
-    matches = re.findall(pattern, llm_output)
+    # 학습 완료 포맷: "Next motion deltas: JOINT:(tok,tok),(tok,tok),... | JOINT:..."
+    # "Next motion deltas:" 이후 텍스트만 사용
+    marker = "Next motion deltas:"
+    start = llm_output.find(marker)
+    if start != -1:
+        llm_output = llm_output[start + len(marker):]
+
+    frame_pat = re.compile(
+        r"\((-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{3}\[ENDNUM\])"
+        r",(-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{3}\[ENDNUM\])\)"
+    )
+    joint_pat = re.compile(r"([A-Z][A-Z_]*):")
 
     result = {}
-    for joint, x_tok, y_tok in matches:
-        dx = decode_token_number(x_tok)
-        dy = decode_token_number(y_tok)
-
-        if joint not in result:
-            result[joint] = []
-        result[joint].append((dx, dy))
+    for seg in llm_output.split(" | "):
+        jm = joint_pat.match(seg.strip())
+        if not jm:
+            continue
+        joint = jm.group(1)
+        frames = []
+        for x_tok, y_tok in frame_pat.findall(seg):
+            dx = decode_token_number(x_tok)
+            dy = decode_token_number(y_tok)
+            frames.append((dx, dy))
+        if frames:
+            result[joint] = frames
     return result
 
 
 pred_deltas = parse_predicted_deltas(generated_text)
 
+if not pred_deltas:
+    print("\n❌ [PARSE FAILED] 모델 출력에서 delta 토큰을 파싱하지 못했습니다.")
+    print("Raw output (first 500 chars):", repr(generated_text[:500]))
+    raise SystemExit(1)
 
 # ----------------------------
 # 6️⃣ 🔥 최종 출력: delta만 출력
@@ -112,13 +130,14 @@ for joint, seq in pred_deltas.items():
         print(f" [{i}]  dx={dx}, dy={dy}")
 
 
-# ... (6번 섹션 끝난 후, 7번 섹션 시작 전이나 직후에 추가)
-
 # 🔥 [수정] max_frames 계산 코드 추가
 # 첫 번째 관절의 예측 길이를 기준으로 설정
-max_frames = len(next(iter(pred_deltas.values())))
+frame_counts = {j: len(seq) for j, seq in pred_deltas.items()}
+max_frames = min(frame_counts.values())
 
-print(f"📊 Predicted Frames: {max_frames}")
+print(f"📊 Predicted Frames (min): {max_frames}")
+print(f"📊 Joints parsed: {len(pred_deltas)}")
+print(f"📊 Frame counts per joint: {frame_counts}")
 
 # ===========================================================
 # 7️⃣ 🔥 Skeleton 2D Animation (FIXED & CONSISTENT)
@@ -184,7 +203,9 @@ def accumulate(base, deltas):
 
 
 abs_positions = {
-    j: accumulate(baseline[j], seq) for j, seq in pred_deltas.items()
+    j: accumulate(baseline[j], seq)
+    for j, seq in pred_deltas.items()
+    if j in baseline  # baseline에 없는 joint는 건너뜀 (미관측 프레임 대비)
 }
 
 print("[DEBUG] abs_positions joints:", list(abs_positions.keys()))
@@ -197,6 +218,7 @@ available_joints = set(abs_positions.keys())
 valid_connections = [
     (a, b)
     for (a, b) in MEDIAPIPE_CONNECTIONS
+    if a in available_joints and b in available_joints
 ]
 
 print("[DEBUG] valid connections:", valid_connections)

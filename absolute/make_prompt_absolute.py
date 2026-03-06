@@ -24,7 +24,7 @@ def num_to_tokens(x: float) -> str:
     x = abs(x)
     int_part = int(x)
     dec_part = int(round((x - int_part) * 1000))
-    return f"[NUM]{sign}[DEC]{int_part:03d}[SEP][DEC]{dec_part:03d}[ENDNUM]"
+    return f"{sign}[NUM][INT]{int_part:03d}[SEP][DEC]{dec_part:03d}[ENDNUM]"
 
 # ----------------------------
 # 3️⃣ 프롬프트 생성 함수 (안전장치 삭제 버전)

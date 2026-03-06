@@ -12,8 +12,8 @@ from make_prompt_absolute import create_prompt_absolute
 # 1️⃣ 모델 & 토크나이저 로드
 # ----------------------------
 # 절대 좌표용으로 학습된 LoRA 가중치가 있다면 해당 경로로 수정 권장
-base_model_dir = "./llama2_local_tokenizerExtension"
-lora_model_dir = "./motionQA_finetuned_lora_mps" ## 여기 파인튜닝한 모델로 수정
+base_model_dir = "../Meta-Llama-3.1-8B_tokenizerExtension"
+lora_model_dir = "../BaseLine/motionQA_delta_finetuned_lora_mps" ## MPS에서 파인튜닝한 delta 모델
 
 print("🔹 Loading model...")
 tokenizer = AutoTokenizer.from_pretrained(base_model_dir, local_files_only=True)
@@ -30,7 +30,7 @@ print("✅ Model + LoRA Adapter Loaded Successfully!")
 # ----------------------------
 # 2️⃣ 프롬프트 생성 (절대 좌표용 함수가 따로 있다면 교체)
 # ----------------------------
-pose_json_path = "./collected_motions/raise_arm_1764194988.json"
+pose_json_path = "../dataset/armRaise/IMG_8646.json"
 # create_prompt_from_pose 함수 내부에서 delta가 아닌 절대값을 뱉도록 구성되어 있어야 합니다.
 
 test_prompt = create_prompt_absolute(pose_json_path)
@@ -52,39 +52,49 @@ with torch.no_grad():
         do_sample=True,
     )
 
-generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+input_len = inputs["input_ids"].shape[1]
+new_token_ids = outputs[0][input_len:]
+generated_text = tokenizer.decode(new_token_ids, skip_special_tokens=False)
 print("\n🧠 [Model Raw Output]\n", generated_text[:1000])
 
 # ----------------------------
 # 4️⃣ 수치 토큰 → float 변환 (동일)
 # ----------------------------
 def decode_token_number(token_str: str):
-    pattern = r"\[NUM\](-?)(?:\[DEC\])?(\d{3})\[SEP\]\[DEC\](\d{3})\[ENDNUM\]"
+    # 학습 포맷: {sign}[NUM][INT]{int}[SEP][DEC]{dec}[ENDNUM]
+    pattern = r"(-?)\[NUM\]\[INT\](\d{3})\[SEP\]\[DEC\](\d{3})\[ENDNUM\]"
     m = re.search(pattern, token_str)
     if not m:
         raise ValueError(f"Invalid token format: {token_str}")
     sign = -1 if m.group(1) == "-" else 1
     int_part = int(m.group(2))
     dec_part = int(m.group(3))
-    v = round(sign * (int_part + dec_part / 1000), 4)
-    return v
+    return round(sign * (int_part + dec_part / 1000), 4)
 
 # ----------------------------
 # 5️⃣ LLM 출력 → joint별 절대 좌표 수집
 # ----------------------------
 def parse_predicted_coordinates(llm_output: str):
-    # 포맷: JOINT:( [NUM]... , [NUM]... )
-    pattern = r"([A-Z_]+):\(\s*(\[NUM\].*?\[ENDNUM\])\s*,\s*(\[NUM\].*?\[ENDNUM\])\s*\)"
-    matches = re.findall(pattern, llm_output)
+    # 학습 완료 포맷: JOINT:(tok,tok),(tok,tok),... | JOINT:...
+    frame_pat = re.compile(
+        r"\((-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{3}\[ENDNUM\])"
+        r",(-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{3}\[ENDNUM\])\)"
+    )
+    joint_pat = re.compile(r"([A-Z][A-Z_]*):")
 
     result = {}
-    for joint, x_tok, y_tok in matches:
-        val_x = decode_token_number(x_tok)
-        val_y = decode_token_number(y_tok)
-
-        if joint not in result:
-            result[joint] = []
-        result[joint].append((val_x, val_y))
+    for seg in llm_output.split(" | "):
+        jm = joint_pat.match(seg.strip())
+        if not jm:
+            continue
+        joint = jm.group(1)
+        frames = []
+        for x_tok, y_tok in frame_pat.findall(seg):
+            val_x = decode_token_number(x_tok)
+            val_y = decode_token_number(y_tok)
+            frames.append((val_x, val_y))
+        if frames:
+            result[joint] = frames
     return result
 
 pred_coords = parse_predicted_coordinates(generated_text)
