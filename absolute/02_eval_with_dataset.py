@@ -40,24 +40,25 @@ model.to(device).to(torch.float32)
 print(f"Model ready on {device}")
 
 # ----------------------------
-# 2 토큰 파싱 (JSONL 포맷: [NUM][INT]000[SEP][DEC]000[ENDNUM])
+# 2 토큰 파싱 (JSONL 포맷: [NUM][INT]000[SEP][DEC]00000[ENDNUM])
 # ----------------------------
 TOKEN_PATTERN = re.compile(
-    r"(-?)\[NUM\]\[INT\](\d{3})\[SEP\]\[DEC\](\d{3})\[ENDNUM\]"
+    r"(-?)\[NUM\]\[INT\](\d{3})\[SEP\]\[DEC\](\d{5})\[ENDNUM\]"
 )
+DEC_SCALE = 100000
 
 def decode_token(s):
     m = TOKEN_PATTERN.search(s)
     if not m:
         raise ValueError(f"Invalid token: {s!r}")
     sign = -1 if m.group(1) == "-" else 1
-    return round(sign * (int(m.group(2)) + int(m.group(3)) / 1000), 4)
+    return round(sign * (int(m.group(2)) + int(m.group(3)) / DEC_SCALE), 6)
 
 
 def parse_delta_sequence(text):
     pat = re.compile(
-        r"([A-Z_]+):\((-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{3}\[ENDNUM\])"
-        r",(-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{3}\[ENDNUM\])\)"
+        r"([A-Z_]+):\((-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{5}\[ENDNUM\])"
+        r",(-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{5}\[ENDNUM\])\)"
     )
     result = {}
     for joint, x_tok, y_tok in pat.findall(text):

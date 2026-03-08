@@ -1,3 +1,13 @@
+# python 06_finetune_llama2_lora.py \
+#   --train-jsonl ./finetune_dataset_delta_train.jsonl \
+#   --max-length 32768
+#   --epochs 20 \
+#   --learning-rate 2e-4 \
+#   --batch-size 1 \
+#   --grad-accum 4 \
+#   --lora-r 32 \
+#   --lora-alpha 64
+
 import argparse
 import inspect
 import json
@@ -17,6 +27,8 @@ from transformers import (
     TrainingArguments,
 )
 
+STRUCT_TOKENS = ["[NUM]", "[INT]", "[DEC]", "[SEP]", "[ENDNUM]"]
+
 
 def choose_output_dir(train_jsonl: str, user_output_dir: str) -> str:
     if user_output_dir:
@@ -28,7 +40,8 @@ def choose_output_dir(train_jsonl: str, user_output_dir: str) -> str:
 
 
 def format_example(prompt: str, completion: str) -> Tuple[str, str]:
-    prompt_text = f"### Instruction ###\n{prompt}\n### End Instruction ###\nAnswer:"
+    # 추론 코드(make_prompt_from_pose.py)와 동일한 포맷 사용
+    prompt_text = prompt
     full_text = f"{prompt_text}\n{completion}"
     return prompt_text, full_text
 
@@ -174,10 +187,11 @@ def build_trainer(
     grad_accum: int,
     save_steps: int,
     logging_steps: int,
+    load_best_at_end: bool,
 ):
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    use_fp16 = device == "cuda"
-    use_bf16 = False
+    use_fp16 = False
+    use_bf16 = device == "cuda"  # RTX 5090은 bf16 네이티브 지원
 
     # transformers 버전마다 TrainingArguments 파라미터명이 다를 수 있어
     # 시그니처를 확인해 지원되는 키만 전달한다.
@@ -206,10 +220,19 @@ def build_trainer(
 
     if has("overwrite_output_dir"):
         ta_kwargs["overwrite_output_dir"] = True
+    if has("save_strategy"):
+        ta_kwargs["save_strategy"] = "steps"
     if has("evaluation_strategy"):
         ta_kwargs["evaluation_strategy"] = "steps" if eval_dataset is not None else "no"
     elif has("eval_strategy"):
         ta_kwargs["eval_strategy"] = "steps" if eval_dataset is not None else "no"
+    if eval_dataset is not None and load_best_at_end:
+        if has("load_best_model_at_end"):
+            ta_kwargs["load_best_model_at_end"] = True
+        if has("metric_for_best_model"):
+            ta_kwargs["metric_for_best_model"] = "eval_loss"
+        if has("greater_is_better"):
+            ta_kwargs["greater_is_better"] = False
 
     args = TrainingArguments(**ta_kwargs)
 
@@ -225,10 +248,75 @@ def build_trainer(
     )
 
 
+def resolve_trainable_special_token_ids(tokenizer) -> List[int]:
+    ids: List[int] = []
+    missing: List[str] = []
+    for tok in STRUCT_TOKENS:
+        tok_id = tokenizer.convert_tokens_to_ids(tok)
+        if tok_id is None or tok_id < 0 or tok_id == tokenizer.unk_token_id:
+            missing.append(tok)
+            continue
+        ids.append(tok_id)
+
+    if missing:
+        raise ValueError(
+            "Special tokens are missing in tokenizer vocab: "
+            f"{missing}. Run tokenizer extension first."
+        )
+    return sorted(set(ids))
+
+
+def find_lm_head_weight_parameter(model) -> Tuple[str, torch.nn.Parameter]:
+    out = model.get_output_embeddings()
+    if out is not None and hasattr(out, "weight") and isinstance(out.weight, torch.nn.Parameter):
+        return "output_embeddings.weight", out.weight
+
+    candidates: List[Tuple[str, torch.nn.Parameter]] = []
+    for name, param in model.named_parameters():
+        if "lm_head" in name and name.endswith("weight"):
+            candidates.append((name, param))
+    if not candidates:
+        raise RuntimeError("Could not find lm_head weight parameter.")
+
+    # Prefer a trainable candidate, then larger tensor.
+    candidates.sort(key=lambda x: (not x[1].requires_grad, -x[1].numel()))
+    return candidates[0]
+
+
+def attach_row_grad_mask(param: torch.nn.Parameter, trainable_rows: List[int]) -> None:
+    if param.ndim != 2:
+        raise ValueError(f"Expected 2D weight matrix for row masking, got shape={tuple(param.shape)}")
+    if not trainable_rows:
+        raise ValueError("trainable_rows must not be empty.")
+    if max(trainable_rows) >= param.shape[0]:
+        raise ValueError(
+            f"Token id out of range for lm_head rows: max_id={max(trainable_rows)}, rows={param.shape[0]}"
+        )
+
+    row_mask = torch.zeros((param.shape[0], 1), dtype=torch.float32)
+    row_mask[trainable_rows] = 1.0
+    cache: Dict[Tuple[str, str], torch.Tensor] = {}
+
+    def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
+        key = (str(grad.device), str(grad.dtype))
+        mask = cache.get(key)
+        if mask is None:
+            mask = row_mask.to(device=grad.device, dtype=grad.dtype)
+            cache[key] = mask
+        return grad * mask
+
+    param.register_hook(_mask_grad)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="LoRA finetuning for local Llama2 on motion JSONL.")
     parser.add_argument("--base-model-dir", default="../Meta-Llama-3.1-8B_tokenizerExtension")
     parser.add_argument("--train-jsonl", default="./finetune_dataset_delta.jsonl")
+    parser.add_argument(
+        "--val-jsonl",
+        default="",
+        help="Optional validation JSONL. If set, this is used for eval instead of random split.",
+    )
     parser.add_argument("--output-dir", default="")
     # --max-length는 "한 샘플(프롬프트+정답+EOS)"의 최대 토큰 길이.
     # 값을 키우면 잘림은 줄지만, 메모리 사용량이 크게 증가한다.
@@ -246,12 +334,37 @@ def main() -> None:
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--no-load-best-at-end",
+        action="store_true",
+        help="Disable automatic loading of the best checkpoint based on eval_loss.",
+    )
+    parser.add_argument(
+        "--no-train-token-io",
+        action="store_true",
+        help="Disable training/saving embed_tokens and lm_head with LoRA.",
+    )
+    parser.add_argument(
+        "--token-io-mode",
+        choices=["full", "special_only", "lm_head_only", "lm_head_special_only", "off"],
+        default="full",
+        help=(
+            "How to train token I/O layers: "
+            "'full'=train full embed/lm_head, "
+            "'special_only'=train only added special token rows, "
+            "'lm_head_only'=train full lm_head only, "
+            "'lm_head_special_only'=train only special token rows in lm_head, "
+            "'off'=freeze token I/O."
+        ),
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
     # 상대경로 인자는 현재 작업 디렉토리가 아니라 스크립트 위치 기준으로 해석한다.
     args.base_model_dir = str((script_dir / args.base_model_dir).resolve()) if not os.path.isabs(args.base_model_dir) else args.base_model_dir
     args.train_jsonl = str((script_dir / args.train_jsonl).resolve()) if not os.path.isabs(args.train_jsonl) else args.train_jsonl
+    if args.val_jsonl and not os.path.isabs(args.val_jsonl):
+        args.val_jsonl = str((script_dir / args.val_jsonl).resolve())
     if args.output_dir and not os.path.isabs(args.output_dir):
         args.output_dir = str((script_dir / args.output_dir).resolve())
 
@@ -259,9 +372,14 @@ def main() -> None:
         raise FileNotFoundError(f"base model dir not found: {args.base_model_dir}")
     if not os.path.exists(args.train_jsonl):
         raise FileNotFoundError(f"train jsonl not found: {args.train_jsonl}")
+    if args.val_jsonl and not os.path.exists(args.val_jsonl):
+        raise FileNotFoundError(f"val jsonl not found: {args.val_jsonl}")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    if args.no_train_token_io:
+        args.token_io_mode = "off"
 
     output_dir = choose_output_dir(args.train_jsonl, args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -275,18 +393,73 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model_dir,
         local_files_only=True,
-        dtype=torch.float32,
+        torch_dtype=torch.bfloat16,  # fp32(32GB) → bf16(16GB), RTX 5090 bf16 지원
     )
 
-    lora_cfg = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    )
+    modules_to_save = None
+    trainable_token_indices = None
+    ensure_weight_tying = False
+    special_token_ids = resolve_trainable_special_token_ids(tokenizer)
+    if args.token_io_mode == "full":
+        modules_to_save = ["embed_tokens", "lm_head"]
+        ensure_weight_tying = True
+    elif args.token_io_mode == "special_only":
+        trainable_token_indices = special_token_ids
+        ensure_weight_tying = bool(getattr(model.config, "tie_word_embeddings", False))
+        if not ensure_weight_tying:
+            print(
+                "[WARN] tie_word_embeddings=False; special_only mode updates input embedding rows only."
+            )
+    elif args.token_io_mode == "lm_head_only":
+        modules_to_save = ["lm_head"]
+    elif args.token_io_mode == "lm_head_special_only":
+        modules_to_save = ["lm_head"]
+
+    lora_sig = inspect.signature(LoraConfig.__init__).parameters
+    lora_kwargs = {
+        "task_type": TaskType.CAUSAL_LM,
+        "r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "bias": "none",
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save": modules_to_save,
+    }
+    if trainable_token_indices is not None:
+        if "trainable_token_indices" not in lora_sig:
+            raise RuntimeError(
+                "Current peft version does not support trainable_token_indices. "
+                "Upgrade peft or use --token-io-mode full/off."
+            )
+        lora_kwargs["trainable_token_indices"] = trainable_token_indices
+    if ensure_weight_tying and "ensure_weight_tying" in lora_sig:
+        lora_kwargs["ensure_weight_tying"] = True
+
+    lora_cfg = LoraConfig(**lora_kwargs)
     model = get_peft_model(model, lora_cfg)
+    if args.token_io_mode == "lm_head_special_only":
+        lm_head_name, lm_head_weight = find_lm_head_weight_parameter(model)
+        attach_row_grad_mask(lm_head_weight, special_token_ids)
+        print(
+            "[INFO] lm_head special-row mask enabled: "
+            f"module={lm_head_name}, token_ids={special_token_ids}"
+        )
+    if args.token_io_mode == "off":
+        print("[INFO] token io train disabled: embed_tokens/lm_head are frozen.")
+    elif args.token_io_mode == "special_only":
+        print(
+            "[INFO] token io train mode=special_only: "
+            f"trainable token ids={trainable_token_indices}"
+        )
+    elif args.token_io_mode == "lm_head_only":
+        print("[INFO] token io train mode=lm_head_only: lm_head full matrix will be updated.")
+    elif args.token_io_mode == "lm_head_special_only":
+        print(
+            "[INFO] token io train mode=lm_head_special_only: "
+            "only special-token rows in lm_head get non-zero gradients."
+        )
+    else:
+        print("[INFO] token io train enabled: embed_tokens/lm_head will be updated and saved.")
     model.print_trainable_parameters()
 
     dataset = MotionJsonlDataset(args.train_jsonl, tokenizer, args.max_length)
@@ -295,7 +468,16 @@ def main() -> None:
 
     eval_dataset = None
     train_dataset = dataset
-    if 0.0 < args.val_ratio < 1.0 and total >= 10:
+
+    # 1) val-jsonl이 있으면 random split 대신 명시적 검증셋을 사용한다.
+    if args.val_jsonl:
+        eval_dataset = MotionJsonlDataset(args.val_jsonl, tokenizer, args.max_length)
+        print(
+            f"[INFO] train samples: {len(train_dataset)}, "
+            f"val samples(from --val-jsonl): {len(eval_dataset)}"
+        )
+    # 2) 없으면 train 내부 random split을 사용한다.
+    elif 0.0 < args.val_ratio < 1.0 and total >= 10:
         val_size = max(1, int(total * args.val_ratio))
         train_size = total - val_size
         train_dataset, eval_dataset = random_split(
@@ -306,6 +488,13 @@ def main() -> None:
         print(f"[INFO] train samples: {len(train_dataset)}, val samples: {len(eval_dataset)}")
     else:
         print("[INFO] validation split skipped")
+
+    if eval_dataset is None and not args.no_load_best_at_end:
+        raise ValueError(
+            "Best-checkpoint selection needs validation data. "
+            "Set --val-jsonl <path> or use --val-ratio > 0 with enough samples, "
+            "or pass --no-load-best-at-end."
+        )
 
     trainer = build_trainer(
         model=model,
@@ -319,10 +508,20 @@ def main() -> None:
         grad_accum=args.grad_accum,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
+        load_best_at_end=not args.no_load_best_at_end,
     )
 
     print("[INFO] Start training")
     trainer.train()
+    if eval_dataset is not None and not args.no_load_best_at_end:
+        if trainer.state.best_model_checkpoint is None:
+            raise RuntimeError(
+                "Best checkpoint was not selected. Check TrainingArguments compatibility and eval setup."
+            )
+        print(
+            f"[INFO] Best checkpoint: {trainer.state.best_model_checkpoint}, "
+            f"best eval_loss: {trainer.state.best_metric}"
+        )
 
     print(f"[INFO] Saving LoRA adapter to: {output_dir}")
     trainer.model.save_pretrained(output_dir)

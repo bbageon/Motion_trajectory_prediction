@@ -2,9 +2,14 @@ llama2_local/
 llama2_local_tokenizerExtension/
 motionQA_delta_finetuned_lora_mps/
 motionQA_finetuned_lora_mps/
+BaseLine/motionQADeltaFileLevelLoraMps/
+BaseLine/motionQaAbsoluteFileLevelRobustScaledClipP95Dec5/
 *.json
 
 /운동데이터
+/영상
+/스쿼트 테스트
+/models
 
 # Python cache/build
 __pycache__/
@@ -44,6 +49,7 @@ Llama-2-70b-chat-hf/
 *.safetensors
 *.bin
 *.pt
+*.pth
 *.ckpt
 
 # Dataset/media artifacts (large)

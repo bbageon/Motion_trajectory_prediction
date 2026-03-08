@@ -342,6 +342,11 @@ def main() -> None:
         action="store_true",
         help="Disable automatic download of pose_landmarker_lite.task when no local model is found.",
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Recursively search subdirectories under --input-dir. Mirrors folder structure in --output-dir.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -390,31 +395,66 @@ def main() -> None:
             raise SystemExit(1)
         return
 
-    paths = sorted(glob.glob(os.path.join(args.input_dir, args.pattern)))
-    if not paths:
-        raise SystemExit(f"No videos found: {os.path.join(args.input_dir, args.pattern)}")
-
     strict = not args.no_strict
     auto_download_model = not args.no_auto_download_model
     success = 0
     failed = 0
 
-    for mp4_path in paths:
-        ok, msg = process_one_file(
-            mp4_path=mp4_path,
-            output_dir=args.output_dir,
-            min_visibility=args.min_visible,
-            strict=strict,
-            required_only=args.required_only,
-            task_model=args.task_model,
-            auto_download_model=auto_download_model,
-        )
-        if ok:
-            success += 1
-            print(f"[OK] {msg}")
-        else:
-            failed += 1
-            print(f"[FAIL] {msg}")
+    if args.recursive:
+        # os.walk로 하위 폴더를 모두 순회하며 MP4 수집
+        import fnmatch
+        tasks = []
+        for dirpath, _, filenames in os.walk(args.input_dir):
+            for filename in sorted(filenames):
+                if fnmatch.fnmatch(filename.lower(), args.pattern.lower()):
+                    mp4_path = os.path.join(dirpath, filename)
+                    # input_dir 기준 상대 경로로 output 폴더 미러링
+                    rel_dir = os.path.relpath(dirpath, args.input_dir)
+                    out_dir = os.path.join(args.output_dir, rel_dir) if rel_dir != "." else args.output_dir
+                    tasks.append((mp4_path, out_dir))
+
+        if not tasks:
+            raise SystemExit(f"No videos found recursively under: {args.input_dir}")
+
+        print(f"[INFO] Found {len(tasks)} video(s) across subdirectories.")
+        for mp4_path, out_dir in tasks:
+            os.makedirs(out_dir, exist_ok=True)
+            ok, msg = process_one_file(
+                mp4_path=mp4_path,
+                output_dir=out_dir,
+                min_visibility=args.min_visible,
+                strict=strict,
+                required_only=args.required_only,
+                task_model=args.task_model,
+                auto_download_model=auto_download_model,
+            )
+            if ok:
+                success += 1
+                print(f"[OK] {msg}")
+            else:
+                failed += 1
+                print(f"[FAIL] {msg}")
+    else:
+        paths = sorted(glob.glob(os.path.join(args.input_dir, args.pattern)))
+        if not paths:
+            raise SystemExit(f"No videos found: {os.path.join(args.input_dir, args.pattern)}")
+
+        for mp4_path in paths:
+            ok, msg = process_one_file(
+                mp4_path=mp4_path,
+                output_dir=args.output_dir,
+                min_visibility=args.min_visible,
+                strict=strict,
+                required_only=args.required_only,
+                task_model=args.task_model,
+                auto_download_model=auto_download_model,
+            )
+            if ok:
+                success += 1
+                print(f"[OK] {msg}")
+            else:
+                failed += 1
+                print(f"[FAIL] {msg}")
 
     print(f"\nDone. success={success}, failed={failed}")
     if failed > 0:

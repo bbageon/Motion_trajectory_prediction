@@ -1,6 +1,7 @@
 import glob
 import json
 import random
+from collections import Counter, defaultdict
 from pathlib import Path
 
 # Input JSON root directory (iterate all action subfolders)
@@ -16,19 +17,19 @@ ARM_JOINTS = [
     "LEFT_WRIST",
 ]
 
-# Sliding-window setup (same policy as delta pipeline)
+# Sliding-window setup
 OBS_FRAMES = 10
 PRED_FRAMES = 8
 STRIDE = 3
 WINDOW = OBS_FRAMES + PRED_FRAMES
 
-# Split ratio (train/val/test = 8:1:1)
+# File-level split ratio (train/val/test = 8:1:1)
 SPLIT_RATIOS = (0.8, 0.1, 0.1)
 RANDOM_SEED = 42
 
-OUTPUT_TRAIN_PATH = "./finetune_dataset_absolute_train.jsonl"
-OUTPUT_VAL_PATH = "./finetune_dataset_absolute_val.jsonl"
-OUTPUT_TEST_PATH = "./finetune_dataset_absolute_test.jsonl"
+OUTPUT_TRAIN_PATH = "./finetune_dataset_absolute_fileLevel_train.jsonl"
+OUTPUT_VAL_PATH = "./finetune_dataset_absolute_fileLevel_val.jsonl"
+OUTPUT_TEST_PATH = "./finetune_dataset_absolute_fileLevel_test.jsonl"
 
 # Robust scaling + optional clipping before tokenization (absolute coordinates)
 APPLY_ROBUST_SCALING = True
@@ -170,54 +171,59 @@ def format_pose_sequence_absolute(
     return " | ".join(formatted)
 
 
-def collect_samples(
+def collect_samples_by_file(
     json_paths: list[str],
     joint_axis_scales: dict[str, dict[str, float]] | None = None,
-) -> list[dict]:
-    samples = []
+) -> dict[str, list[dict]]:
+    samples_by_file: dict[str, list[dict]] = {}
 
     for path in json_paths:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-            seq = data.get("pose_sequence", [])
-            if len(seq) < WINDOW + 1:
+        seq = data.get("pose_sequence", [])
+        if len(seq) < WINDOW + 1:
+            continue
+
+        source_file = path.replace("\\", "/")
+        action = Path(path).parent.name
+        rows: list[dict] = []
+        for start in range(0, len(seq) - WINDOW, STRIDE):
+            obs = seq[start : start + OBS_FRAMES]
+            pred = seq[start + OBS_FRAMES : start + WINDOW]
+            obs_abs = format_pose_sequence_absolute(
+                obs, max_frames=OBS_FRAMES, joint_axis_scales=joint_axis_scales
+            )
+            pred_abs = format_pose_sequence_absolute(
+                pred, max_frames=PRED_FRAMES, joint_axis_scales=joint_axis_scales
+            )
+            if not obs_abs or not pred_abs:
                 continue
+            rows.append(
+                {
+                    "prompt": f"Observed absolute coordinates: {obs_abs}",
+                    "completion": f"Next absolute coordinates: {pred_abs}",
+                    "task": "trajectory_absolute",
+                    "source_file": source_file,
+                    "action": action,
+                }
+            )
 
-            action = Path(path).parent.name
-            for start in range(0, len(seq) - WINDOW, STRIDE):
-                obs = seq[start : start + OBS_FRAMES]
-                pred = seq[start + OBS_FRAMES : start + WINDOW]
+        if rows:
+            samples_by_file[source_file] = rows
 
-                obs_abs = format_pose_sequence_absolute(
-                    obs, max_frames=OBS_FRAMES, joint_axis_scales=joint_axis_scales
-                )
-                pred_abs = format_pose_sequence_absolute(
-                    pred, max_frames=PRED_FRAMES, joint_axis_scales=joint_axis_scales
-                )
-                if not obs_abs or not pred_abs:
-                    continue
-
-                samples.append(
-                    {
-                        "prompt": f"Observed absolute coordinates: {obs_abs}",
-                        "completion": f"Next absolute coordinates: {pred_abs}",
-                        "task": "trajectory_absolute",
-                        "source_file": path.replace("\\", "/"),
-                        "action": action,
-                    }
-                )
-
-    return samples
+    return samples_by_file
 
 
-def split_samples(samples: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
-    if not samples:
-        return [], [], []
+def split_file_paths_stratified(
+    file_paths: list[str], rng: random.Random
+) -> tuple[set[str], set[str], set[str]]:
+    if not file_paths:
+        return set(), set(), set()
 
-    random.seed(RANDOM_SEED)
-    random.shuffle(samples)
+    paths = file_paths[:]
+    rng.shuffle(paths)
 
-    n = len(samples)
+    n = len(paths)
     n_train = int(n * SPLIT_RATIOS[0])
     n_val = int(n * SPLIT_RATIOS[1])
     n_test = n - n_train - n_val
@@ -229,10 +235,51 @@ def split_samples(samples: list[dict]) -> tuple[list[dict], list[dict], list[dic
     if n_train + n_val + n_test > n:
         n_train = max(0, n - n_val - n_test)
 
-    train = samples[:n_train]
-    val = samples[n_train : n_train + n_val]
-    test = samples[n_train + n_val : n_train + n_val + n_test]
+    train = set(paths[:n_train])
+    val = set(paths[n_train : n_train + n_val])
+    test = set(paths[n_train + n_val : n_train + n_val + n_test])
     return train, val, test
+
+
+def split_by_file(
+    samples_by_file: dict[str, list[dict]],
+) -> tuple[list[dict], list[dict], list[dict], dict[str, set[str]]]:
+    # Weakly stratified by action at file granularity.
+    files_by_action: dict[str, list[str]] = defaultdict(list)
+    for source_file, rows in samples_by_file.items():
+        action = rows[0]["action"]
+        files_by_action[action].append(source_file)
+
+    rng = random.Random(RANDOM_SEED)
+    split_files = {"train": set(), "val": set(), "test": set()}
+    for action, file_paths in files_by_action.items():
+        train_f, val_f, test_f = split_file_paths_stratified(file_paths, rng)
+        split_files["train"].update(train_f)
+        split_files["val"].update(val_f)
+        split_files["test"].update(test_f)
+
+    if split_files["train"] & split_files["val"]:
+        raise RuntimeError("File overlap detected between train and val.")
+    if split_files["train"] & split_files["test"]:
+        raise RuntimeError("File overlap detected between train and test.")
+    if split_files["val"] & split_files["test"]:
+        raise RuntimeError("File overlap detected between val and test.")
+
+    train_rows: list[dict] = []
+    val_rows: list[dict] = []
+    test_rows: list[dict] = []
+    for source_file, rows in samples_by_file.items():
+        if source_file in split_files["train"]:
+            train_rows.extend(rows)
+        elif source_file in split_files["val"]:
+            val_rows.extend(rows)
+        elif source_file in split_files["test"]:
+            test_rows.extend(rows)
+
+    rng.shuffle(train_rows)
+    rng.shuffle(val_rows)
+    rng.shuffle(test_rows)
+    return train_rows, val_rows, test_rows, split_files
 
 
 def write_jsonl(path: str, rows: list[dict]) -> None:
@@ -244,7 +291,12 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def convert_all_to_absolute() -> None:
+def action_counter(rows: list[dict]) -> dict[str, int]:
+    c = Counter(row.get("action", "unknown") for row in rows)
+    return dict(sorted(c.items()))
+
+
+def convert_all_to_absolute_file_level() -> None:
     json_paths = collect_json_paths()
     if not json_paths:
         raise SystemExit(f"No JSON files found under: {INPUT_ROOT_DIR}")
@@ -258,21 +310,29 @@ def convert_all_to_absolute() -> None:
         if APPLY_CLIPPING:
             print(f"[INFO] clipping enabled: c={CLIP_C}")
 
-    samples = collect_samples(json_paths, joint_axis_scales=joint_axis_scales)
-    train_rows, val_rows, test_rows = split_samples(samples)
+    samples_by_file = collect_samples_by_file(json_paths, joint_axis_scales=joint_axis_scales)
+    train_rows, val_rows, test_rows, split_files = split_by_file(samples_by_file)
 
     write_jsonl(OUTPUT_TRAIN_PATH, train_rows)
     write_jsonl(OUTPUT_VAL_PATH, val_rows)
     write_jsonl(OUTPUT_TEST_PATH, test_rows)
 
+    total_samples = len(train_rows) + len(val_rows) + len(test_rows)
     print(
-        f"[DONE] total={len(samples)} | "
+        f"[DONE:file-level] total_samples={total_samples} | "
         f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)}"
     )
+    print(
+        f"[FILES] train={len(split_files['train'])} "
+        f"val={len(split_files['val'])} test={len(split_files['test'])}"
+    )
+    print(f"[ACTIONS] train={action_counter(train_rows)}")
+    print(f"[ACTIONS] val  ={action_counter(val_rows)}")
+    print(f"[ACTIONS] test ={action_counter(test_rows)}")
     print(f" - train: {OUTPUT_TRAIN_PATH}")
     print(f" - val  : {OUTPUT_VAL_PATH}")
     print(f" - test : {OUTPUT_TEST_PATH}")
 
 
 if __name__ == "__main__":
-    convert_all_to_absolute()
+    convert_all_to_absolute_file_level()

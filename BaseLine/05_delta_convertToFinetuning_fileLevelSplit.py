@@ -1,6 +1,7 @@
 import glob
 import json
 import random
+from collections import Counter, defaultdict
 from pathlib import Path
 
 # 입력 JSON 루트 폴더 (하위 동작 폴더 전체 순회)
@@ -8,22 +9,27 @@ INPUT_ROOT_DIR = "../dataset/new_data"
 
 # 학습에 사용할 관절 (None이면 전체 사용)
 ARM_JOINTS = [
-    "RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST",
-    "LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST",
+    "RIGHT_SHOULDER",
+    "RIGHT_ELBOW",
+    "RIGHT_WRIST",
+    "LEFT_SHOULDER",
+    "LEFT_ELBOW",
+    "LEFT_WRIST",
 ]
-# Sliding window 설정
-OBS_FRAMES = 10   # 관측 프레임 수
-PRED_FRAMES = 8   # 예측 프레임 수
-STRIDE = 3        # 윈도우 이동 간격 (작을수록 샘플 많아짐)
-WINDOW = OBS_FRAMES + PRED_FRAMES  # 총 윈도우 크기
 
-# 분할 비율 (train/val/test = 8:1:1)
+# Sliding window 설정
+OBS_FRAMES = 10
+PRED_FRAMES = 8
+STRIDE = 3
+WINDOW = OBS_FRAMES + PRED_FRAMES
+
+# 파일 단위 분할 비율 (train/val/test = 8:1:1)
 SPLIT_RATIOS = (0.8, 0.1, 0.1)
 RANDOM_SEED = 42
 
-OUTPUT_TRAIN_PATH = "./finetune_dataset_delta_train.jsonl"
-OUTPUT_VAL_PATH = "./finetune_dataset_delta_val.jsonl"
-OUTPUT_TEST_PATH = "./finetune_dataset_delta_test.jsonl"
+OUTPUT_TRAIN_PATH = "./finetune_dataset_delta_fileLevel_train.jsonl"
+OUTPUT_VAL_PATH = "./finetune_dataset_delta_fileLevel_val.jsonl"
+OUTPUT_TEST_PATH = "./finetune_dataset_delta_fileLevel_test.jsonl"
 
 # Robust scaling + optional clipping before tokenization
 # 옵션 1: delta' = delta / (s + eps), 중심 이동 없이 0 유지
@@ -119,7 +125,6 @@ def save_scaling_config(path: str, scales: dict[str, float]) -> None:
         "clip_enabled": APPLY_CLIPPING,
         "clip_c": CLIP_C,
         "joint_scale": scales,
-        # backward compatibility for scripts that still read joint_gain.
         "joint_gain": gains_compat,
         "note": (
             "delta_scaled = clip(delta_raw / (scale + eps), -c, c); "
@@ -161,9 +166,7 @@ def format_pose_sequence_deltas(
                 dy_raw = y2 - y1
                 dx = scale_delta(dx_raw, joint, joint_scales)
                 dy = scale_delta(dy_raw, joint, joint_scales)
-                dx_tok = num_to_tokens(dx)
-                dy_tok = num_to_tokens(dy)
-                deltas.append(f"({dx_tok},{dy_tok})")
+                deltas.append(f"({num_to_tokens(dx)},{num_to_tokens(dy)})")
 
         if deltas:
             formatted.append(f"{joint}:{','.join(deltas[:max_frames])}")
@@ -171,48 +174,53 @@ def format_pose_sequence_deltas(
     return " | ".join(formatted)
 
 
-def collect_samples(json_paths: list[str], joint_scales: dict[str, float] | None = None) -> list[dict]:
-    samples = []
+def collect_samples_by_file(
+    json_paths: list[str],
+    joint_scales: dict[str, float] | None = None,
+) -> dict[str, list[dict]]:
+    samples_by_file: dict[str, list[dict]] = {}
 
     for path in json_paths:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-            seq = data.get("pose_sequence", [])
-            if len(seq) < WINDOW + 1:
+        seq = data.get("pose_sequence", [])
+        if len(seq) < WINDOW + 1:
+            continue
+
+        source_file = path.replace("\\", "/")
+        action = Path(path).parent.name
+        rows: list[dict] = []
+        for start in range(0, len(seq) - WINDOW, STRIDE):
+            obs = seq[start : start + OBS_FRAMES]
+            pred = seq[start + OBS_FRAMES : start + WINDOW]
+            obs_deltas = format_pose_sequence_deltas(obs, joint_scales=joint_scales)
+            pred_deltas = format_pose_sequence_deltas(pred, joint_scales=joint_scales)
+            if not obs_deltas or not pred_deltas:
                 continue
+            rows.append(
+                {
+                    "prompt": f"Observed motion deltas: {obs_deltas}",
+                    "completion": f"Next motion deltas: {pred_deltas}",
+                    "task": "trajectory_delta",
+                    "source_file": source_file,
+                    "action": action,
+                }
+            )
 
-            action = Path(path).parent.name
-            # sliding window: stride 간격으로 윈도우를 이동하며 샘플 추출
-            for start in range(0, len(seq) - WINDOW, STRIDE):
-                obs = seq[start : start + OBS_FRAMES]
-                pred = seq[start + OBS_FRAMES : start + WINDOW]
+        if rows:
+            samples_by_file[source_file] = rows
 
-                obs_deltas = format_pose_sequence_deltas(obs, joint_scales=joint_scales)
-                pred_deltas = format_pose_sequence_deltas(pred, joint_scales=joint_scales)
-                if not obs_deltas or not pred_deltas:
-                    continue
-
-                samples.append(
-                    {
-                        "prompt": f"Observed motion deltas: {obs_deltas}",
-                        "completion": f"Next motion deltas: {pred_deltas}",
-                        "task": "trajectory_delta",
-                        "source_file": path.replace("\\", "/"),
-                        "action": action,
-                    }
-                )
-
-    return samples
+    return samples_by_file
 
 
-def split_samples(samples: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
-    if not samples:
-        return [], [], []
+def split_file_paths_stratified(file_paths: list[str], rng: random.Random) -> tuple[set[str], set[str], set[str]]:
+    if not file_paths:
+        return set(), set(), set()
 
-    random.seed(RANDOM_SEED)
-    random.shuffle(samples)
+    paths = file_paths[:]
+    rng.shuffle(paths)
 
-    n = len(samples)
+    n = len(paths)
     n_train = int(n * SPLIT_RATIOS[0])
     n_val = int(n * SPLIT_RATIOS[1])
     n_test = n - n_train - n_val
@@ -224,10 +232,50 @@ def split_samples(samples: list[dict]) -> tuple[list[dict], list[dict], list[dic
     if n_train + n_val + n_test > n:
         n_train = max(0, n - n_val - n_test)
 
-    train = samples[:n_train]
-    val = samples[n_train : n_train + n_val]
-    test = samples[n_train + n_val : n_train + n_val + n_test]
+    train = set(paths[:n_train])
+    val = set(paths[n_train : n_train + n_val])
+    test = set(paths[n_train + n_val : n_train + n_val + n_test])
     return train, val, test
+
+
+def split_by_file(samples_by_file: dict[str, list[dict]]) -> tuple[list[dict], list[dict], list[dict], dict[str, set[str]]]:
+    # action별 파일 리스트를 만든 뒤, action 단위로 파일 분할(약한 stratified split)
+    files_by_action: dict[str, list[str]] = defaultdict(list)
+    for source_file, rows in samples_by_file.items():
+        action = rows[0]["action"]
+        files_by_action[action].append(source_file)
+
+    rng = random.Random(RANDOM_SEED)
+    split_files = {"train": set(), "val": set(), "test": set()}
+    for action, file_paths in files_by_action.items():
+        train_f, val_f, test_f = split_file_paths_stratified(file_paths, rng)
+        split_files["train"].update(train_f)
+        split_files["val"].update(val_f)
+        split_files["test"].update(test_f)
+
+    # 안전 체크: 파일 겹침 없어야 함
+    if split_files["train"] & split_files["val"]:
+        raise RuntimeError("File overlap detected between train and val.")
+    if split_files["train"] & split_files["test"]:
+        raise RuntimeError("File overlap detected between train and test.")
+    if split_files["val"] & split_files["test"]:
+        raise RuntimeError("File overlap detected between val and test.")
+
+    train_rows: list[dict] = []
+    val_rows: list[dict] = []
+    test_rows: list[dict] = []
+    for source_file, rows in samples_by_file.items():
+        if source_file in split_files["train"]:
+            train_rows.extend(rows)
+        elif source_file in split_files["val"]:
+            val_rows.extend(rows)
+        elif source_file in split_files["test"]:
+            test_rows.extend(rows)
+
+    rng.shuffle(train_rows)
+    rng.shuffle(val_rows)
+    rng.shuffle(test_rows)
+    return train_rows, val_rows, test_rows, split_files
 
 
 def write_jsonl(path: str, rows: list[dict]) -> None:
@@ -239,7 +287,12 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def convert_all_to_delta() -> None:
+def action_counter(rows: list[dict]) -> dict[str, int]:
+    c = Counter(row.get("action", "unknown") for row in rows)
+    return dict(sorted(c.items()))
+
+
+def convert_all_to_delta_file_level() -> None:
     json_paths = collect_json_paths()
     if not json_paths:
         raise SystemExit(f"No JSON files found under: {INPUT_ROOT_DIR}")
@@ -253,21 +306,29 @@ def convert_all_to_delta() -> None:
         if APPLY_CLIPPING:
             print(f"[INFO] clipping enabled: c={CLIP_C}")
 
-    samples = collect_samples(json_paths, joint_scales=joint_scales)
-    train_rows, val_rows, test_rows = split_samples(samples)
+    samples_by_file = collect_samples_by_file(json_paths, joint_scales=joint_scales)
+    train_rows, val_rows, test_rows, split_files = split_by_file(samples_by_file)
 
     write_jsonl(OUTPUT_TRAIN_PATH, train_rows)
     write_jsonl(OUTPUT_VAL_PATH, val_rows)
     write_jsonl(OUTPUT_TEST_PATH, test_rows)
 
+    total_samples = len(train_rows) + len(val_rows) + len(test_rows)
     print(
-        f"[DONE] total={len(samples)} | "
+        f"[DONE:file-level] total_samples={total_samples} | "
         f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)}"
     )
+    print(
+        f"[FILES] train={len(split_files['train'])} "
+        f"val={len(split_files['val'])} test={len(split_files['test'])}"
+    )
+    print(f"[ACTIONS] train={action_counter(train_rows)}")
+    print(f"[ACTIONS] val  ={action_counter(val_rows)}")
+    print(f"[ACTIONS] test ={action_counter(test_rows)}")
     print(f" - train: {OUTPUT_TRAIN_PATH}")
     print(f" - val  : {OUTPUT_VAL_PATH}")
     print(f" - test : {OUTPUT_TEST_PATH}")
 
 
 if __name__ == "__main__":
-    convert_all_to_delta()
+    convert_all_to_delta_file_level()
