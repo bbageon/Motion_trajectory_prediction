@@ -1,6 +1,7 @@
 import argparse
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -9,8 +10,6 @@ import torch
 from matplotlib.animation import FuncAnimation, PillowWriter
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from make_prompt_absolute import create_prompt_absolute
 
 MARKER_OBS = "Observed absolute coordinates:"
 MARKER_NEXT = "Next absolute coordinates:"
@@ -54,13 +53,12 @@ MEDIAPIPE_CONNECTIONS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Single-sample absolute inference + visualization (pose JSON or test JSONL sample)."
+        description="Single-sample absolute inference + visualization (JSONL sample only)."
     )
-    parser.add_argument("--mode", choices=["jsonl", "pose"], default="jsonl")
     parser.add_argument("--base-model-dir", default="../Meta-Llama-3.1-8B_tokenizerExtension")
     parser.add_argument(
         "--lora-model-dir",
-        default="../BaseLine/motionQA_absolute_finetuned_lora_mps",
+        default="../BaseLine/motionQaAbsoluteFileLevelV2",
     )
     parser.add_argument("--test-jsonl", default="../BaseLine/finetune_dataset_absolute_test.jsonl")
     parser.add_argument("--action", default="", help="Filter action for jsonl mode: 90/basic/vertical")
@@ -70,13 +68,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Index within filtered samples (jsonl mode).",
     )
-    parser.add_argument("--pose-json-path", default="../dataset/armRaise/IMG_8646.json")
-    parser.add_argument("--max-new-tokens", type=int, default=800)
-    parser.add_argument("--min-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--min-new-tokens", type=int, default=1024)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--repetition-penalty", type=float, default=1.2)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument(
         "--absolute-scale-config",
         default=DEFAULT_SCALE_CONFIG,
@@ -85,19 +82,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-absolute-scaling",
         action="store_true",
-        help="Disable inverse scaling for parsed coordinates and disable scaling in pose-mode prompt.",
+        help="Disable inverse scaling for parsed coordinates.",
     )
-    parser.add_argument(
-        "--append-target-prefix",
-        action="store_true",
-        help="Append '\\nNext absolute coordinates:' to prompt before generation.",
-    )
+    parser.add_argument("--x100", action="store_true",
+        help="x100 inverse scaling: decoded value ÷ 100. Auto-disables RS scaling.")
     parser.add_argument("--output-prefix", default="predicted_motion_absolute")
     parser.add_argument("--no-show", action="store_true")
     return parser.parse_args()
 
 
-def decode_token_number(token_str: str) -> float:
+def decode_token_number(token_str: str, x100: bool = False) -> float:
     pattern = r"(-?)\[NUM\]\[INT\](\d{3})\[SEP\]\[DEC\](\d{5})\[ENDNUM\]"
     m = re.search(pattern, token_str)
     if not m:
@@ -105,10 +99,56 @@ def decode_token_number(token_str: str) -> float:
     sign = -1 if m.group(1) == "-" else 1
     int_part = int(m.group(2))
     dec_part = int(m.group(3))
-    return round(sign * (int_part + dec_part / DEC_SCALE), DEC_DIGITS + 1)
+    val = round(sign * (int_part + dec_part / DEC_SCALE), DEC_DIGITS + 1)
+    return val / 100.0 if x100 else val
 
 
-def parse_coords(text: str, marker: str) -> Dict[str, List[Tuple[float, float]]]:
+def _to_ascii_digits(text: str) -> str:
+    out = []
+    for ch in text:
+        if "0" <= ch <= "9":
+            out.append(ch)
+            continue
+        try:
+            out.append(str(unicodedata.digit(ch)))
+        except (TypeError, ValueError):
+            continue
+    return "".join(out)
+
+
+def _parse_numeric_fragment(fragment: str) -> float | None:
+    frag = fragment.strip()
+    if not frag:
+        return None
+
+    m = re.search(
+        r"(-?)\s*\[NUM\]\s*\[INT\]\s*(\d{3})\s*\[SEP\]\s*\[DEC\]\s*(\d{5})\s*\[ENDNUM\]",
+        frag,
+    )
+    if m:
+        sign = -1 if m.group(1) == "-" else 1
+        int_part = int(m.group(2))
+        dec_part = int(m.group(3))
+        return round(sign * (int_part + dec_part / DEC_SCALE), DEC_DIGITS + 1)
+
+    sign = -1 if re.search(r"[-−﹣－]", frag) else 1
+    digits = _to_ascii_digits(frag)
+    if len(digits) >= 8:
+        core = digits[-8:]
+        int_part = int(core[:3])
+        dec_part = int(core[3:8])
+        return round(sign * (int_part + dec_part / DEC_SCALE), DEC_DIGITS + 1)
+
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", frag)
+    if m:
+        try:
+            return round(float(m.group(0)), DEC_DIGITS + 1)
+        except ValueError:
+            return None
+    return None
+
+
+def parse_coords(text: str, marker: str, x100: bool = False) -> Dict[str, List[Tuple[float, float]]]:
     start = text.find(marker)
     if start != -1:
         text = text[start + len(marker) :]
@@ -131,7 +171,17 @@ def parse_coords(text: str, marker: str) -> Dict[str, List[Tuple[float, float]]]
         seg = text[seg_start:seg_end]
         frames = []
         for x_tok, y_tok in frame_pat.findall(seg):
-            frames.append((decode_token_number(x_tok), decode_token_number(y_tok)))
+            frames.append((decode_token_number(x_tok, x100), decode_token_number(y_tok, x100)))
+        if not frames:
+            for inner in re.findall(r"\(([^()]*)\)", seg):
+                parts = re.split(r"[,،|]", inner, maxsplit=1)
+                if len(parts) < 2:
+                    continue
+                x = _parse_numeric_fragment(parts[0])
+                y = _parse_numeric_fragment(parts[1])
+                if x is None or y is None:
+                    continue
+                frames.append((x, y))
         if frames:
             result[joint] = frames
     return result
@@ -206,36 +256,24 @@ def main() -> None:
     base_model_dir = (script_dir / args.base_model_dir).resolve()
     lora_model_dir = (script_dir / args.lora_model_dir).resolve()
     test_jsonl_path = (script_dir / args.test_jsonl).resolve()
-    pose_json_path = (script_dir / args.pose_json_path).resolve()
     scale_config_path = (script_dir / args.absolute_scale_config).resolve()
-    apply_absolute_scaling = not args.no_absolute_scaling
+    x100 = args.x100
+    apply_absolute_scaling = (not args.no_absolute_scaling) and (not x100)
 
     print(f"[INFO] base model: {base_model_dir}")
     print(f"[INFO] lora model: {lora_model_dir}")
+    print(f"[INFO] x100 inverse scaling: {'ENABLED (÷100)' if x100 else 'DISABLED'}")
     if apply_absolute_scaling:
         print(f"[INFO] absolute scaling config: {scale_config_path}")
 
-    if args.mode == "jsonl":
-        prompt, gt_completion, source_file, action = load_jsonl_sample(
-            test_jsonl_path, args.action.strip(), args.sample_index
-        )
-        source_json_path = Path(source_file) if source_file else pose_json_path
-        print(
-            f"[INFO] selected sample -> action={action}, sample_index={args.sample_index}, source={source_json_path}"
-        )
-        if args.append_target_prefix:
-            prompt = f"{prompt}\n{MARKER_NEXT}"
-    else:
-        source_json_path = pose_json_path
-        action = "pose"
-        prompt = create_prompt_absolute(
-            str(source_json_path),
-            apply_absolute_scaling=apply_absolute_scaling,
-            absolute_scale_config_path=str(scale_config_path),
-        )
-        prompt = f"{prompt}\n{MARKER_NEXT}"
-        gt_completion = ""
-        print(f"[INFO] pose mode source={source_json_path}")
+    prompt, gt_completion, source_file, action = load_jsonl_sample(
+        test_jsonl_path, args.action.strip(), args.sample_index
+    )
+    source_json_path = Path(source_file)
+    print(
+        f"[INFO] selected sample -> action={action}, sample_index={args.sample_index}, source={source_json_path}"
+    )
+    prompt = f"{prompt}\n{MARKER_NEXT}"
 
     print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(str(base_model_dir), local_files_only=True)
@@ -254,6 +292,7 @@ def main() -> None:
     model.to(device)
     print(f"[INFO] model ready on {device}")
 
+    print(f"\n{'='*60}\n[DEBUG] FULL PROMPT:\n{'='*60}\n{prompt}\n{'='*60}\n")
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     print(f"[INFO] prompt tokens={inputs['input_ids'].shape[1]}")
 
@@ -283,7 +322,7 @@ def main() -> None:
     print("[INFO] raw output head:")
     print(generated_text[:500])
 
-    pred_abs = parse_coords(generated_text, MARKER_NEXT)
+    pred_abs = parse_coords(generated_text, MARKER_NEXT, x100=x100)
     joint_axis_scales, scale_eps = (
         load_scale_config(scale_config_path) if apply_absolute_scaling else ({}, 1e-6)
     )
@@ -293,7 +332,7 @@ def main() -> None:
         raise SystemExit(1)
     print(f"[INFO] parsed joints={len(pred_abs)}")
 
-    gt_abs = parse_coords(gt_completion, MARKER_NEXT) if gt_completion else {}
+    gt_abs = parse_coords(gt_completion, MARKER_NEXT, x100=x100) if gt_completion else {}
     gt_abs = inverse_scale_coords(gt_abs, joint_axis_scales, scale_eps)
 
     frame_counts = {j: len(v) for j, v in pred_abs.items()}

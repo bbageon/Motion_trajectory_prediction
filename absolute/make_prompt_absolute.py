@@ -1,29 +1,43 @@
 import json
+import re
 from pathlib import Path
 
-# ----------------------------
-# 1️⃣ 시스템 지시문
-# ----------------------------
-prompt_system = (
-    "You are a motion prediction assistant that forecasts future absolute joint coordinates "
-    "based on the observed motion sequence."
-)
-
-# {0}: 관찰 프레임 수, {1}: 예측 프레임 수, {2}: 데이터 본문
-prompt_template = (
-    "Forecast the next {1:d} absolute (x, y) coordinates for all observed joints using the given {0:d} observed frames.\n"
-    "Each coordinate is tokenized as [NUM][DEC]000[SEP][DEC]00000[ENDNUM].\n"
-    "Return a valid JSON object with predicted coordinates for each joint in the same format.\n"
-    "{2:s}"
-)
-
 DEFAULT_SCALE_CONFIG = "../BaseLine/absolute_scaling_config.json"
+MARKER_OBS = "Observed absolute coordinates:"
+MARKER_NEXT = "Next absolute coordinates:"
 DEC_DIGITS = 5
 DEC_SCALE = 10**DEC_DIGITS
 
 # ----------------------------
-# 2️⃣ 수치형 토큰 변환
+# 시스템 지시문 + 프롬프트 템플릿
 # ----------------------------
+PROMPT_SYSTEM = (
+    "You are a motion prediction assistant that extrapolates future joint movements "
+    "based on observed absolute (x, y) coordinate sequences. "
+    "IMPORTANT: Provide EXACTLY 8 frames. Do not provide more or less."
+)
+
+PROMPT_TEMPLATE = (
+    "Forecast the next {pred_len:d} (x, y) absolute coordinates for all observed joints "
+    "using the given {obs_len:d} observed coordinate frames.\n"
+    "Each coordinate value must follow this token format: -[NUM][INT]000[SEP][DEC]00000[ENDNUM] "
+    "(minus sign optional).\n"
+    "Return one line in this exact format:\n"
+    "Next absolute coordinates: JOINT:(tok,tok),(tok,tok),... | JOINT:(tok,tok),...\n"
+    "### Observed Absolute Coordinate Sequences ###\n"
+    "{obs_text}"
+)
+
+ARM_JOINTS = [
+    "RIGHT_SHOULDER",
+    "RIGHT_ELBOW",
+    "RIGHT_WRIST",
+    "LEFT_SHOULDER",
+    "LEFT_ELBOW",
+    "LEFT_WRIST",
+]
+
+
 def num_to_tokens(x: float) -> str:
     sign = "-" if x < 0 else ""
     x = abs(x)
@@ -76,85 +90,109 @@ def scale_coord(
         out = max(-clip_c, min(clip_c, out))
     return round(out, DEC_DIGITS)
 
-# ----------------------------
-# 3️⃣ 프롬프트 생성 함수 (안전장치 삭제 버전)
-# ----------------------------
+
 def create_prompt_absolute(
-    path: str,
+    path_or_data,
+    pred_len: int = 8,
+    max_obs: int = 10,
+    with_system: bool = True,
+    prompt_style: str = "train",
     apply_absolute_scaling: bool = True,
     absolute_scale_config_path: str = DEFAULT_SCALE_CONFIG,
 ):
     """
-    OpenPose JSON 파일 → 절대 좌표(x, y) 추출 → 팔 관절 필터링 → 50:50 분할 프롬프트 생성
+    Build absolute-coordinate prediction prompt from pose_sequence JSON.
+    - train style: "Observed absolute coordinates: JOINT:(tok,tok),... | JOINT:..."
+    - instruct style: system/template + observed section
     """
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    pose_seq = data["pose_sequence"]
-    joint_axis_scales, eps, clip_enabled, clip_c = ({}, 1e-6, False, 0.0)
+    if isinstance(path_or_data, (str, Path)):
+        with open(path_or_data, encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = path_or_data
+
+    pose_seq = data.get("pose_sequence", [])
+    if not pose_seq:
+        return MARKER_OBS
+
+    joint_axis_scales = {}
+    eps = 1e-6
+    clip_enabled = False
+    clip_c = 0.0
     if apply_absolute_scaling:
         joint_axis_scales, eps, clip_enabled, clip_c = load_scale_config(absolute_scale_config_path)
 
-    ARM_JOINTS = [
-        "RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST",
-        "LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST",
-    ]
+    joints_list = [j for j in pose_seq[0].keys() if j in ARM_JOINTS]
+    if not joints_list:
+        return MARKER_OBS
 
-    # 1. 데이터 정제 및 필터링
-    absolute_seq = []
-    for frame in pose_seq:
-        frame_coords = {}
-        valid_frame = True
-        for joint in ARM_JOINTS:
-            if joint in frame:
-                x, y = frame[joint]
-                if apply_absolute_scaling:
-                    x = scale_coord(x, joint, "x", joint_axis_scales, eps, clip_enabled, clip_c)
-                    y = scale_coord(y, joint, "y", joint_axis_scales, eps, clip_enabled, clip_c)
-                else:
-                    x = round(x, DEC_DIGITS)
-                    y = round(y, DEC_DIGITS)
-                frame_coords[joint] = (x, y)
+    obs_seq = pose_seq[-max_obs:] if max_obs > 0 else pose_seq
+    parts = []
+    obs_len = 0
+    for joint in joints_list:
+        coords = []
+        for frame in obs_seq:
+            if joint not in frame:
+                continue
+            x, y = frame[joint]
+            if apply_absolute_scaling:
+                x = scale_coord(x, joint, "x", joint_axis_scales, eps, clip_enabled, clip_c)
+                y = scale_coord(y, joint, "y", joint_axis_scales, eps, clip_enabled, clip_c)
             else:
-                valid_frame = False
-                break
-        if valid_frame:
-            absolute_seq.append(frame_coords)
+                x = round(x, DEC_DIGITS)
+                y = round(y, DEC_DIGITS)
+            coords.append(f"({num_to_tokens(x)},{num_to_tokens(y)})")
+        if coords:
+            obs_len = max(obs_len, len(coords))
+            parts.append(f"{joint}:{','.join(coords)}")
 
-    # 🚨 [수정] 고정 길이(8프레임 등) 안전장치를 삭제하고 Delta 코드와 동일하게 50% 분할
-    mid = len(absolute_seq) // 2
-    obs_seq = absolute_seq[:mid]
-    pred_len = len(absolute_seq) - mid
+    obs_text = " | ".join(parts)
+    if not obs_text:
+        return MARKER_OBS
+    if prompt_style == "train":
+        return f"{MARKER_OBS} {obs_text}"
 
-    # 2. 텍스트 포맷팅
-    def format_sequence(seq):
-        lines = []
-        for f in seq:
-            parts = [
-                f"{joint}:({num_to_tokens(f[joint][0])},{num_to_tokens(f[joint][1])})"
-                for joint in ARM_JOINTS
-            ]
-            lines.append(" | ".join(parts))
-        return "\n".join(lines)
+    base_prompt = PROMPT_TEMPLATE.format(pred_len=pred_len, obs_len=obs_len, obs_text=obs_text)
+    if with_system:
+        return f"{PROMPT_SYSTEM}\n\n{base_prompt}"
+    return base_prompt
 
-    obs_text = format_sequence(obs_seq)
 
-    # 3. 최종 예측 프롬프트 조립
-    # {0}: len(obs_seq), {1}: pred_len
-    base_prompt = prompt_template.format(len(obs_seq), pred_len, obs_text)
-    
-    final_prompt = (
-        f"{prompt_system}\n\n"
-        f"### Instruction ###\n{base_prompt}\n### End Instruction ###"
-    )
+def build_instruct_prompt_from_observed(
+    observed_prompt: str,
+    pred_len: int = 8,
+    with_system: bool = True,
+) -> str:
+    """
+    Convert JSONL train-style observed prompt to instruct-style prompt.
+    Input example: "Observed absolute coordinates: JOINT:(tok,tok),... | JOINT:..."
+    """
+    text = (observed_prompt or "").strip()
+    prefix = MARKER_OBS
+    obs_text = text[len(prefix) :].strip() if text.startswith(prefix) else text
 
-    return final_prompt
+    obs_len = 0
+    if obs_text:
+        first_seg = obs_text.split(" | ", 1)[0]
+        if ":" in first_seg:
+            first_seg = first_seg.split(":", 1)[1]
+        frame_pat = re.compile(
+            r"\(\s*-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{5}\[ENDNUM\]\s*,\s*"
+            r"-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{5}\[ENDNUM\]\s*\)"
+        )
+        obs_len = len(frame_pat.findall(first_seg))
 
-# 독립 테스트
+    base_prompt = PROMPT_TEMPLATE.format(pred_len=pred_len, obs_len=obs_len, obs_text=obs_text)
+    if with_system:
+        return f"{PROMPT_SYSTEM}\n\n{base_prompt}"
+    return base_prompt
+
+
 if __name__ == "__main__":
     path = "./collected_motions/raise_arm.json"
     try:
         prompt = create_prompt_absolute(path)
-        print("[OK] Absolute prompt created (variable length mode).")
-        print(prompt[:1000]) # 앞부분 출력
+        print("[OK] Absolute train-style prompt created.")
+        print(prompt[:1000])
     except FileNotFoundError:
         print(f"[ERROR] File not found: {path}")

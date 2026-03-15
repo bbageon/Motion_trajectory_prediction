@@ -39,6 +39,32 @@ def choose_output_dir(train_jsonl: str, user_output_dir: str) -> str:
     return "./motionQA_delta_finetuned_lora_mps"
 
 
+def resolve_resume_checkpoint(resume_arg: str, output_dir: str) -> str:
+    candidate = (resume_arg or "").strip()
+    if not candidate:
+        return ""
+    if candidate.lower() not in {"last", "latest", "auto"}:
+        return candidate
+
+    out_dir = Path(output_dir)
+    if not out_dir.exists():
+        raise ValueError(f"Output dir does not exist: {out_dir}")
+
+    checkpoints = []
+    for p in out_dir.iterdir():
+        if not p.is_dir() or not p.name.startswith("checkpoint-"):
+            continue
+        suffix = p.name.split("-", 1)[1]
+        if suffix.isdigit():
+            checkpoints.append((int(suffix), p))
+
+    if not checkpoints:
+        raise ValueError(f"No checkpoint-* directories found in: {out_dir}")
+
+    checkpoints.sort(key=lambda x: x[0])
+    return str(checkpoints[-1][1])
+
+
 def format_example(prompt: str, completion: str) -> Tuple[str, str]:
     # 추론 코드(make_prompt_from_pose.py)와 동일한 포맷 사용
     prompt_text = prompt
@@ -322,18 +348,23 @@ def main() -> None:
     # 값을 키우면 잘림은 줄지만, 메모리 사용량이 크게 증가한다.
     # Transformer attention 비용은 길이에 대해 대략 O(L^2)로 증가하므로
     # 길이를 2배로 키우면 메모리/연산량이 4배 수준으로 뛸 수 있다.
-    parser.add_argument("--max-length", type=int, default=1024)
-    parser.add_argument("--epochs", type=float, default=3.0)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--max-length", type=int, default=4096)
+    parser.add_argument("--epochs", type=float, default=6.0)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-steps", type=int, default=100)
-    parser.add_argument("--logging-steps", type=int, default=10)
+    parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default="",
+        help="Checkpoint path to resume from. Use 'last' to auto-pick latest checkpoint-* in output-dir.",
+    )
     parser.add_argument(
         "--no-load-best-at-end",
         action="store_true",
@@ -511,8 +542,13 @@ def main() -> None:
         load_best_at_end=not args.no_load_best_at_end,
     )
 
+    resume_checkpoint = resolve_resume_checkpoint(args.resume_from_checkpoint, output_dir)
     print("[INFO] Start training")
-    trainer.train()
+    if resume_checkpoint:
+        print(f"[INFO] Resuming from checkpoint: {resume_checkpoint}")
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
+    else:
+        trainer.train()
     if eval_dataset is not None and not args.no_load_best_at_end:
         if trainer.state.best_model_checkpoint is None:
             raise RuntimeError(

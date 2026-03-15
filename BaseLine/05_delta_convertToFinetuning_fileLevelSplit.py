@@ -27,14 +27,14 @@ WINDOW = OBS_FRAMES + PRED_FRAMES
 SPLIT_RATIOS = (0.8, 0.1, 0.1)
 RANDOM_SEED = 42
 
-OUTPUT_TRAIN_PATH = "./finetune_dataset_delta_fileLevel_train.jsonl"
-OUTPUT_VAL_PATH = "./finetune_dataset_delta_fileLevel_val.jsonl"
-OUTPUT_TEST_PATH = "./finetune_dataset_delta_fileLevel_test.jsonl"
+OUTPUT_TRAIN_PATH = "./finetune_dataset_delta_noScale_fileLevel_train.jsonl"
+OUTPUT_VAL_PATH = "./finetune_dataset_delta_noScale_fileLevel_val.jsonl"
+OUTPUT_TEST_PATH = "./finetune_dataset_delta_noScale_fileLevel_test.jsonl"
 
 # Robust scaling + optional clipping before tokenization
 # 옵션 1: delta' = delta / (s + eps), 중심 이동 없이 0 유지
 # 옵션 2: delta' = clip(delta', -c, c)
-APPLY_ROBUST_SCALING = True
+APPLY_ROBUST_SCALING = False
 SCALE_PERCENTILE = 95.0
 SCALE_EPS = 1e-6
 APPLY_CLIPPING = True

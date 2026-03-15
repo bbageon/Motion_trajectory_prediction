@@ -10,7 +10,6 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from make_prompt_from_pose import create_prompt_from_pose
 
 MARKER_OBS = "Observed motion deltas:"
 MARKER_NEXT = "Next motion deltas:"
@@ -54,9 +53,8 @@ MEDIAPIPE_CONNECTIONS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Single-sample delta inference + visualization (pose JSON or test JSONL sample)."
+        description="Single-sample delta inference + visualization (JSONL sample only)."
     )
-    parser.add_argument("--mode", choices=["jsonl", "pose"], default="jsonl")
     parser.add_argument("--base-model-dir", default="../Meta-Llama-3.1-8B_tokenizerExtension")
     parser.add_argument(
         "--lora-model-dir",
@@ -70,13 +68,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Index within filtered samples (jsonl mode).",
     )
-    parser.add_argument("--pose-json-path", default="../dataset/armRaise/IMG_8646.json")
-    parser.add_argument("--max-new-tokens", type=int, default=800)
-    parser.add_argument("--min-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--min-new-tokens", type=int, default=1024)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--repetition-penalty", type=float, default=1.2)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument(
         "--delta-scale-config",
         default=DEFAULT_SCALE_CONFIG,
@@ -85,19 +82,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-delta-scaling",
         action="store_true",
-        help="Disable inverse scaling for parsed deltas and disable scaling in pose-mode prompt.",
+        help="Disable inverse scaling for parsed deltas.",
     )
-    parser.add_argument(
-        "--append-target-prefix",
-        action="store_true",
-        help="Append '\\nNext motion deltas:' to prompt before generation (recommended for jsonl mode).",
-    )
+    parser.add_argument("--x100", action="store_true",
+        help="x100 inverse scaling: decoded value ÷ 100. Auto-disables RS scaling.")
     parser.add_argument("--output-prefix", default="predicted_motion_delta")
     parser.add_argument("--no-show", action="store_true")
     return parser.parse_args()
 
 
-def decode_token_number(token_str: str) -> float:
+def decode_token_number(token_str: str, x100: bool = False) -> float:
     pattern = r"(-?)\[NUM\]\[INT\](\d{3})\[SEP\]\[DEC\](\d{5})\[ENDNUM\]"
     m = re.search(pattern, token_str)
     if not m:
@@ -105,10 +99,11 @@ def decode_token_number(token_str: str) -> float:
     sign = -1 if m.group(1) == "-" else 1
     int_part = int(m.group(2))
     dec_part = int(m.group(3))
-    return round(sign * (int_part + dec_part / DEC_SCALE), DEC_DIGITS + 1)
+    val = round(sign * (int_part + dec_part / DEC_SCALE), DEC_DIGITS + 1)
+    return val / 100.0 if x100 else val
 
 
-def parse_deltas(text: str, marker: str) -> Dict[str, List[Tuple[float, float]]]:
+def parse_deltas(text: str, marker: str, x100: bool = False) -> Dict[str, List[Tuple[float, float]]]:
     start = text.find(marker)
     if start != -1:
         text = text[start + len(marker) :]
@@ -131,7 +126,7 @@ def parse_deltas(text: str, marker: str) -> Dict[str, List[Tuple[float, float]]]
         seg = text[seg_start:seg_end]
         frames = []
         for x_tok, y_tok in frame_pat.findall(seg):
-            frames.append((decode_token_number(x_tok), decode_token_number(y_tok)))
+            frames.append((decode_token_number(x_tok, x100), decode_token_number(y_tok, x100)))
         if frames:
             result[joint] = frames
     return result
@@ -276,38 +271,24 @@ def main() -> None:
     base_model_dir = (script_dir / args.base_model_dir).resolve()
     lora_model_dir = (script_dir / args.lora_model_dir).resolve()
     test_jsonl_path = (script_dir / args.test_jsonl).resolve()
-    pose_json_path = (script_dir / args.pose_json_path).resolve()
     scale_config_path = (script_dir / args.delta_scale_config).resolve()
-    apply_delta_scaling = not args.no_delta_scaling
+    x100 = args.x100
+    apply_delta_scaling = (not args.no_delta_scaling) and (not x100)
 
     print(f"[INFO] base model: {base_model_dir}")
     print(f"[INFO] lora model: {lora_model_dir}")
+    print(f"[INFO] x100 inverse scaling: {'ENABLED (÷100)' if x100 else 'DISABLED'}")
     if apply_delta_scaling:
         print(f"[INFO] delta scaling config: {scale_config_path}")
 
-    if args.mode == "jsonl":
-        prompt, gt_completion, source_file, action = load_jsonl_sample(
-            test_jsonl_path, args.action.strip(), args.sample_index
-        )
-        source_json_path = Path(source_file)
-        print(
-            f"[INFO] selected sample -> action={action}, sample_index={args.sample_index}, source={source_json_path}"
-        )
-        if args.append_target_prefix:
-            prompt = f"{prompt}\n{MARKER_NEXT}"
-    else:
-        source_json_path = pose_json_path
-        action = "pose"
-        # 학습 JSONL과 동일한 입력 형식으로 맞춘다.
-        prompt = create_prompt_from_pose(
-            str(source_json_path),
-            prompt_style="train",
-            apply_delta_scaling=apply_delta_scaling,
-            delta_scale_config_path=str(scale_config_path),
-        )
-        prompt = f"{prompt}\n{MARKER_NEXT}"
-        gt_completion = ""
-        print(f"[INFO] pose mode source={source_json_path}")
+    prompt, gt_completion, source_file, action = load_jsonl_sample(
+        test_jsonl_path, args.action.strip(), args.sample_index
+    )
+    source_json_path = Path(source_file)
+    print(
+        f"[INFO] selected sample -> action={action}, sample_index={args.sample_index}, source={source_json_path}"
+    )
+    prompt = f"{prompt}\n{MARKER_NEXT}"
 
     print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(str(base_model_dir), local_files_only=True)
@@ -355,7 +336,7 @@ def main() -> None:
     print("[INFO] raw output head:")
     print(generated_text[:500])
 
-    pred_deltas = parse_deltas(generated_text, MARKER_NEXT)
+    pred_deltas = parse_deltas(generated_text, MARKER_NEXT, x100=x100)
     joint_scales, scale_eps, clip_enabled, clip_c = (
         load_scale_config(scale_config_path) if apply_delta_scaling else ({}, 1e-6, False, 0.0)
     )
@@ -365,7 +346,7 @@ def main() -> None:
         raise SystemExit(1)
     print(f"[INFO] parsed joints={len(pred_deltas)}")
 
-    gt_deltas = parse_deltas(gt_completion, MARKER_NEXT) if gt_completion else {}
+    gt_deltas = parse_deltas(gt_completion, MARKER_NEXT, x100=x100) if gt_completion else {}
     gt_deltas = inverse_scale_deltas(gt_deltas, joint_scales, scale_eps)
 
     with open(source_json_path, "r", encoding="utf-8") as f:
@@ -373,26 +354,25 @@ def main() -> None:
     pose_sequence = src_payload["pose_sequence"]
 
     baseline_frame = pose_sequence[-1]
-    if args.mode == "jsonl":
-        obs_deltas = parse_deltas(prompt, MARKER_OBS)
-        win_start = find_window_start_from_prompt(
-            pose_sequence,
-            obs_deltas,
-            joint_scales=joint_scales if apply_delta_scaling else None,
-            scale_eps=scale_eps,
-            clip_enabled=clip_enabled,
-            clip_c=clip_c,
-        )
-        if win_start is not None and obs_deltas:
-            obs_steps = min(len(v) for v in obs_deltas.values())
-            pred_first_idx = win_start + obs_steps + 1
-            if pred_first_idx < len(pose_sequence):
-                baseline_frame = pose_sequence[pred_first_idx]
-                print(
-                    f"[INFO] matched window start={win_start}, baseline_frame_idx={pred_first_idx}"
-                )
-        else:
-            print("[WARN] prompt window match failed; fallback baseline=last frame.")
+    obs_deltas = parse_deltas(prompt, MARKER_OBS)
+    win_start = find_window_start_from_prompt(
+        pose_sequence,
+        obs_deltas,
+        joint_scales=joint_scales if apply_delta_scaling else None,
+        scale_eps=scale_eps,
+        clip_enabled=clip_enabled,
+        clip_c=clip_c,
+    )
+    if win_start is not None and obs_deltas:
+        obs_steps = min(len(v) for v in obs_deltas.values())
+        pred_first_idx = win_start + obs_steps + 1
+        if pred_first_idx < len(pose_sequence):
+            baseline_frame = pose_sequence[pred_first_idx]
+            print(
+                f"[INFO] matched window start={win_start}, baseline_frame_idx={pred_first_idx}"
+            )
+    else:
+        print("[WARN] prompt window match failed; fallback baseline=last frame.")
 
     pred_abs = build_absolute_positions(baseline_frame, pred_deltas)
     gt_abs = build_absolute_positions(baseline_frame, gt_deltas) if gt_deltas else {}

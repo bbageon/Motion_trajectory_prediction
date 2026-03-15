@@ -4,10 +4,10 @@ import random
 from collections import Counter, defaultdict
 from pathlib import Path
 
-# Input JSON root directory (iterate all action subfolders)
+# 입력 JSON 루트 폴더 (하위 동작 폴더 전체 순회)
 INPUT_ROOT_DIR = "../dataset/new_data"
 
-# Joints used for training
+# 학습에 사용할 관절 (None이면 전체 사용)
 ARM_JOINTS = [
     "RIGHT_SHOULDER",
     "RIGHT_ELBOW",
@@ -17,27 +17,24 @@ ARM_JOINTS = [
     "LEFT_WRIST",
 ]
 
-# Sliding-window setup
+# Sliding window 설정
 OBS_FRAMES = 10
 PRED_FRAMES = 8
 STRIDE = 3
 WINDOW = OBS_FRAMES + PRED_FRAMES
 
-# File-level split ratio (train/val/test = 8:1:1)
+# 파일 단위 분할 비율 (train/val/test = 8:1:1)
 SPLIT_RATIOS = (0.8, 0.1, 0.1)
 RANDOM_SEED = 42
 
-OUTPUT_TRAIN_PATH = "./finetune_dataset_absolute_noScale_fileLevel_train.jsonl"
-OUTPUT_VAL_PATH = "./finetune_dataset_absolute_noScale_fileLevel_val.jsonl"
-OUTPUT_TEST_PATH = "./finetune_dataset_absolute_noScale_fileLevel_test.jsonl"
+OUTPUT_TRAIN_PATH = "./x100 데이터/finetune_dataset_delta_x100_fileLevel_train.jsonl"
+OUTPUT_VAL_PATH = "./x100 데이터/finetune_dataset_delta_x100_fileLevel_val.jsonl"
+OUTPUT_TEST_PATH = "./x100 데이터/finetune_dataset_delta_x100_fileLevel_test.jsonl"
 
-# 스케일링 기법 적용 유무
+# ×100 선형 스케일: delta 값에 SCALE_FACTOR를 곱해 [INT] 토큰을 다양하게 만듦
+# Robust Scaling 미적용, 단순 선형 변환만 사용
 APPLY_ROBUST_SCALING = False
-SCALE_PERCENTILE = 95.0
-SCALE_EPS = 1e-6
-APPLY_CLIPPING = True
-CLIP_C = 8.0
-SCALING_CONFIG_PATH = "./absolute_scaling_config.json"
+SCALE_FACTOR = 100.0  # delta × 100 → [INT]가 000~010 범위로 다양해짐
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEC_DIGITS = 5
@@ -58,23 +55,6 @@ def num_to_tokens(val: float) -> str:
     )
 
 
-def _percentile(values: list[float], q: float) -> float:
-    if not values:
-        return 0.0
-    if q <= 0:
-        return min(values)
-    if q >= 100:
-        return max(values)
-    arr = sorted(values)
-    pos = (len(arr) - 1) * (q / 100.0)
-    lo = int(pos)
-    hi = min(lo + 1, len(arr) - 1)
-    if lo == hi:
-        return arr[lo]
-    frac = pos - lo
-    return arr[lo] * (1.0 - frac) + arr[hi] * frac
-
-
 def collect_json_paths() -> list[str]:
     input_root = Path(INPUT_ROOT_DIR)
     if not input_root.is_absolute():
@@ -83,98 +63,35 @@ def collect_json_paths() -> list[str]:
     return sorted(glob.glob(pattern, recursive=True))
 
 
-def build_joint_axis_scales(json_paths: list[str]) -> dict[str, dict[str, float]]:
-    vals_x: dict[str, list[float]] = {j: [] for j in ARM_JOINTS}
-    vals_y: dict[str, list[float]] = {j: [] for j in ARM_JOINTS}
-    for path in json_paths:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        seq = data.get("pose_sequence", [])
-        for frame in seq:
-            for joint in ARM_JOINTS:
-                if joint in frame:
-                    x, y = frame[joint]
-                    vals_x[joint].append(abs(x))
-                    vals_y[joint].append(abs(y))
-
-    scales: dict[str, dict[str, float]] = {}
-    for joint in ARM_JOINTS:
-        sx = _percentile(vals_x[joint], SCALE_PERCENTILE)
-        sy = _percentile(vals_y[joint], SCALE_PERCENTILE)
-        if sx <= SCALE_EPS:
-            sx = SCALE_EPS
-        if sy <= SCALE_EPS:
-            sy = SCALE_EPS
-        scales[joint] = {"x": round(sx, 8), "y": round(sy, 8)}
-    return scales
+def apply_x100(val: float) -> float:
+    """delta 값에 ×100 적용 후 반올림."""
+    return round(val * SCALE_FACTOR, DEC_DIGITS)
 
 
-def save_scaling_config(path: str, scales: dict[str, dict[str, float]]) -> None:
-    out_path = Path(path)
-    if not out_path.is_absolute():
-        out_path = (SCRIPT_DIR / out_path).resolve()
-    payload = {
-        "enabled": APPLY_ROBUST_SCALING,
-        "method": "robust_divide_scale_then_clip_absolute",
-        "percentile_q": SCALE_PERCENTILE,
-        "eps": SCALE_EPS,
-        "clip_enabled": APPLY_CLIPPING,
-        "clip_c": CLIP_C,
-        "joint_axis_scale": scales,
-        "note": (
-            "coord_scaled = clip(coord_raw / (scale_axis + eps), -c, c); "
-            "inverse: coord_raw = coord_scaled * (scale_axis + eps)."
-        ),
-    }
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def scale_coord(
-    val: float,
-    joint: str,
-    axis: str,
-    joint_axis_scales: dict[str, dict[str, float]] | None,
-) -> float:
-    if not joint_axis_scales:
-        return round(val, DEC_DIGITS)
-    s = joint_axis_scales.get(joint, {}).get(axis, 1.0)
-    out = val / (s + SCALE_EPS)
-    if APPLY_CLIPPING:
-        out = max(-CLIP_C, min(CLIP_C, out))
-    return round(out, DEC_DIGITS)
-
-
-def format_pose_sequence_absolute(
-    seq,
-    max_frames: int = 10,
-    joint_axis_scales: dict[str, dict[str, float]] | None = None,
-) -> str:
-    if not seq:
+def format_pose_sequence_deltas(seq, max_frames: int = 10) -> str:
+    if len(seq) < 2:
         return ""
 
     formatted = []
     joints_list = [j for j in seq[0].keys() if ARM_JOINTS is None or j in ARM_JOINTS]
 
     for joint in joints_list:
-        coords = []
-        for frame in seq[:max_frames]:
-            if joint in frame:
-                x, y = frame[joint]
-                x = scale_coord(x, joint, "x", joint_axis_scales)
-                y = scale_coord(y, joint, "y", joint_axis_scales)
-                coords.append(f"({num_to_tokens(x)},{num_to_tokens(y)})")
+        deltas = []
+        for i in range(1, len(seq)):
+            if joint in seq[i] and joint in seq[i - 1]:
+                x1, y1 = seq[i - 1][joint]
+                x2, y2 = seq[i][joint]
+                dx = apply_x100(x2 - x1)
+                dy = apply_x100(y2 - y1)
+                deltas.append(f"({num_to_tokens(dx)},{num_to_tokens(dy)})")
 
-        if coords:
-            formatted.append(f"{joint}:{','.join(coords)}")
+        if deltas:
+            formatted.append(f"{joint}:{','.join(deltas[:max_frames])}")
 
     return " | ".join(formatted)
 
 
-def collect_samples_by_file(
-    json_paths: list[str],
-    joint_axis_scales: dict[str, dict[str, float]] | None = None,
-) -> dict[str, list[dict]]:
+def collect_samples_by_file(json_paths: list[str]) -> dict[str, list[dict]]:
     samples_by_file: dict[str, list[dict]] = {}
 
     for path in json_paths:
@@ -190,19 +107,15 @@ def collect_samples_by_file(
         for start in range(0, len(seq) - WINDOW, STRIDE):
             obs = seq[start : start + OBS_FRAMES]
             pred = seq[start + OBS_FRAMES : start + WINDOW]
-            obs_abs = format_pose_sequence_absolute(
-                obs, max_frames=OBS_FRAMES, joint_axis_scales=joint_axis_scales
-            )
-            pred_abs = format_pose_sequence_absolute(
-                pred, max_frames=PRED_FRAMES, joint_axis_scales=joint_axis_scales
-            )
-            if not obs_abs or not pred_abs:
+            obs_deltas = format_pose_sequence_deltas(obs)
+            pred_deltas = format_pose_sequence_deltas(pred)
+            if not obs_deltas or not pred_deltas:
                 continue
             rows.append(
                 {
-                    "prompt": f"Observed absolute coordinates: {obs_abs}",
-                    "completion": f"Next absolute coordinates: {pred_abs}",
-                    "task": "trajectory_absolute",
+                    "prompt": f"Observed motion deltas: {obs_deltas}",
+                    "completion": f"Next motion deltas: {pred_deltas}",
+                    "task": "trajectory_delta",
                     "source_file": source_file,
                     "action": action,
                 }
@@ -214,9 +127,7 @@ def collect_samples_by_file(
     return samples_by_file
 
 
-def split_file_paths_stratified(
-    file_paths: list[str], rng: random.Random
-) -> tuple[set[str], set[str], set[str]]:
+def split_file_paths_stratified(file_paths: list[str], rng: random.Random) -> tuple[set[str], set[str], set[str]]:
     if not file_paths:
         return set(), set(), set()
 
@@ -241,10 +152,7 @@ def split_file_paths_stratified(
     return train, val, test
 
 
-def split_by_file(
-    samples_by_file: dict[str, list[dict]],
-) -> tuple[list[dict], list[dict], list[dict], dict[str, set[str]]]:
-    # Weakly stratified by action at file granularity.
+def split_by_file(samples_by_file: dict[str, list[dict]]) -> tuple[list[dict], list[dict], list[dict], dict[str, set[str]]]:
     files_by_action: dict[str, list[str]] = defaultdict(list)
     for source_file, rows in samples_by_file.items():
         action = rows[0]["action"]
@@ -286,6 +194,7 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
     out_path = Path(path)
     if not out_path.is_absolute():
         out_path = (SCRIPT_DIR / out_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fout:
         for row in rows:
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -296,21 +205,15 @@ def action_counter(rows: list[dict]) -> dict[str, int]:
     return dict(sorted(c.items()))
 
 
-def convert_all_to_absolute_file_level() -> None:
+def convert_all_to_delta_x100_file_level() -> None:
     json_paths = collect_json_paths()
     if not json_paths:
         raise SystemExit(f"No JSON files found under: {INPUT_ROOT_DIR}")
 
-    joint_axis_scales = None
-    if APPLY_ROBUST_SCALING:
-        joint_axis_scales = build_joint_axis_scales(json_paths)
-        save_scaling_config(SCALING_CONFIG_PATH, joint_axis_scales)
-        print(f"[INFO] robust scaling enabled, config saved: {SCALING_CONFIG_PATH}")
-        print(f"[INFO] joint-axis scales(q{SCALE_PERCENTILE}): {joint_axis_scales}")
-        if APPLY_CLIPPING:
-            print(f"[INFO] clipping enabled: c={CLIP_C}")
+    print(f"[INFO] x100 linear scaling: delta × {SCALE_FACTOR} (no Robust Scaling)")
+    print(f"[INFO] [INT] token range after x100: typically 000~010 for normalized coords")
 
-    samples_by_file = collect_samples_by_file(json_paths, joint_axis_scales=joint_axis_scales)
+    samples_by_file = collect_samples_by_file(json_paths)
     train_rows, val_rows, test_rows, split_files = split_by_file(samples_by_file)
 
     write_jsonl(OUTPUT_TRAIN_PATH, train_rows)
@@ -335,4 +238,4 @@ def convert_all_to_absolute_file_level() -> None:
 
 
 if __name__ == "__main__":
-    convert_all_to_absolute_file_level()
+    convert_all_to_delta_x100_file_level()

@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 # 이 모듈은 pose_sequence(JSON)를 읽어
@@ -155,6 +156,36 @@ def create_prompt_from_pose(
         return f"Observed motion deltas: {obs_text}"
 
     obs_len = max((len(v) for v in obs.values()), default=0)
+    base_prompt = PROMPT_TEMPLATE.format(pred_len=pred_len, obs_len=obs_len, obs_text=obs_text)
+    if with_system:
+        return f"{PROMPT_SYSTEM}\n\n{base_prompt}"
+    return base_prompt
+
+
+def build_instruct_prompt_from_observed(
+    observed_prompt: str,
+    pred_len: int = 8,
+    with_system: bool = True,
+) -> str:
+    """
+    Convert JSONL train-style observed prompt to instruct-style prompt.
+    Input example: "Observed motion deltas: JOINT:(tok,tok),... | JOINT:..."
+    """
+    text = (observed_prompt or "").strip()
+    prefix = "Observed motion deltas:"
+    obs_text = text[len(prefix) :].strip() if text.startswith(prefix) else text
+
+    obs_len = 0
+    if obs_text:
+        first_seg = obs_text.split(" | ", 1)[0]
+        if ":" in first_seg:
+            first_seg = first_seg.split(":", 1)[1]
+        frame_pat = re.compile(
+            r"\(\s*-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{5}\[ENDNUM\]\s*,\s*"
+            r"-?\[NUM\]\[INT\]\d{3}\[SEP\]\[DEC\]\d{5}\[ENDNUM\]\s*\)"
+        )
+        obs_len = len(frame_pat.findall(first_seg))
+
     base_prompt = PROMPT_TEMPLATE.format(pred_len=pred_len, obs_len=obs_len, obs_text=obs_text)
     if with_system:
         return f"{PROMPT_SYSTEM}\n\n{base_prompt}"
