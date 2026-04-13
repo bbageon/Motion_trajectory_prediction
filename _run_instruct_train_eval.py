@@ -1,0 +1,181 @@
+"""
+Instruct-style prompt 실험 순차 실행 스크립트.
+1. Delta instruct 데이터 생성
+2. Absolute instruct 데이터 생성
+3. Delta instruct 학습
+4. Absolute instruct 학습
+5. Delta instruct 평가
+6. Absolute instruct 평가
+
+각 단계의 로그를 logs/ 폴더에 저장.
+실행: conda run -n motionqa python _run_instruct_train_eval.py
+"""
+
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+BASELINE = ROOT / "BaseLine"
+DELTA_DIR = ROOT / "delta"
+ABSOLUTE_DIR = ROOT / "absolute"
+LOG_DIR = ROOT / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+
+def run_step(label: str, args: list, cwd: Path) -> bool:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = LOG_DIR / f"{timestamp}_{label.replace(' ', '_')}.log"
+
+    print(f"\n{'='*60}")
+    print(f"[RUN] {label}")
+    print(f"[CWD] {cwd}")
+    print(f"[LOG] {log_file}")
+    print(f"{'='*60}", flush=True)
+
+    with open(log_file, "w", encoding="utf-8") as lf:
+        lf.write(f"# {label}\n")
+        lf.write(f"# started: {datetime.now()}\n")
+        lf.write(f"# cwd: {cwd}\n")
+        lf.write(f"# cmd: {' '.join(str(a) for a in args)}\n\n")
+        lf.flush()
+
+        process = subprocess.Popen(
+            args,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8:replace"},
+        )
+
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            lf.write(line)
+            lf.flush()
+
+        process.wait()
+
+    with open(log_file, "a", encoding="utf-8") as lf:
+        lf.write(f"\n# finished: {datetime.now()}\n")
+        lf.write(f"# return code: {process.returncode}\n")
+
+    if process.returncode != 0:
+        print(f"\n[ERROR] '{label}' failed (code {process.returncode}). Log: {log_file}")
+        return False
+
+    print(f"\n[DONE] '{label}' completed. Log: {log_file}")
+    return True
+
+
+STEPS = [
+    # ── 데이터 생성 ──
+    {
+        "label": "00a_generate_delta_instruct_data",
+        "cwd": BASELINE,
+        "args": [
+            sys.executable, "05_delta_convertToFinetuning_fileLevelSplit.py",
+        ],
+    },
+    {
+        "label": "00b_generate_absolute_instruct_data",
+        "cwd": BASELINE,
+        "args": [
+            sys.executable, "05_abs_convertToFinetuning_fileLevelSplit.py",
+        ],
+    },
+    # ── 학습 ──
+    {
+        "label": "01_train_delta_instruct",
+        "cwd": BASELINE,
+        "args": [
+            sys.executable, "06_finetune_llama2_lora.py",
+            "--train-jsonl", "finetune_dataset_delta_noScale_instruct_fileLevel_train.jsonl",
+            "--val-jsonl",   "finetune_dataset_delta_noScale_instruct_fileLevel_val.jsonl",
+            "--output-dir",  "instruct_delta_noScale_fileLevel_lora",
+            "--max-length",  "4096",
+            "--learning-rate", "5e-5",
+            "--epochs",      "6",
+            "--batch-size",  "1",
+            "--grad-accum",  "8",
+            "--lora-r",      "16",
+            "--lora-alpha",  "32",
+            "--lora-dropout", "0.05",
+            "--token-io-mode", "special_only",
+        ],
+    },
+    {
+        "label": "02_train_absolute_instruct",
+        "cwd": BASELINE,
+        "args": [
+            sys.executable, "06_finetune_llama2_lora.py",
+            "--train-jsonl", "finetune_dataset_absolute_noScale_instruct_fileLevel_train.jsonl",
+            "--val-jsonl",   "finetune_dataset_absolute_noScale_instruct_fileLevel_val.jsonl",
+            "--output-dir",  "instruct_absolute_noScale_fileLevel_lora",
+            "--max-length",  "4096",
+            "--learning-rate", "5e-5",
+            "--epochs",      "6",
+            "--batch-size",  "1",
+            "--grad-accum",  "8",
+            "--lora-r",      "16",
+            "--lora-alpha",  "32",
+            "--lora-dropout", "0.05",
+            "--token-io-mode", "special_only",
+        ],
+    },
+    # ── 평가 ──
+    {
+        "label": "03_eval_delta_instruct",
+        "cwd": DELTA_DIR,
+        "args": [
+            sys.executable, "01_test2_delta_noScale_evalation.py",
+            "--lora-model-dir", str(BASELINE / "instruct_delta_noScale_fileLevel_lora"),
+            "--test-jsonl", str(BASELINE / "finetune_dataset_delta_noScale_instruct_fileLevel_test.jsonl"),
+            "--append-target-prefix",
+            "--accumulate-to-absolute",
+            "--output-report", "./delta_instruct_eval_report.json",
+        ],
+    },
+    {
+        "label": "04_eval_absolute_instruct",
+        "cwd": ABSOLUTE_DIR,
+        "args": [
+            sys.executable, "01_test2_absolute_noScale_evalation.py",
+            "--lora-model-dir", str(BASELINE / "instruct_absolute_noScale_fileLevel_lora"),
+            "--test-jsonl", str(BASELINE / "finetune_dataset_absolute_noScale_instruct_fileLevel_test.jsonl"),
+            "--append-target-prefix",
+            "--output-report", "./absolute_instruct_eval_report.json",
+        ],
+    },
+]
+
+
+def main():
+    print(f"[START] Instruct-style prompt 전체 파이프라인 시작: {datetime.now()}")
+    print(f"[LOG DIR] {LOG_DIR}")
+
+    results = {}
+    for step in STEPS:
+        ok = run_step(step["label"], step["args"], step["cwd"])
+        results[step["label"]] = "OK" if ok else "FAILED"
+        if not ok:
+            print(f"[WARN] '{step['label']}' 실패 - 다음 단계로 계속 진행합니다.")
+
+    print(f"\n{'='*60}")
+    print(f"[ALL DONE] 파이프라인 완료: {datetime.now()}")
+    print(f"[LOGS] {LOG_DIR}")
+    print("\n[결과 요약]")
+    for label, status in results.items():
+        mark = "OK" if status == "OK" else "FAILED"
+        print(f"  [{mark}] {label}: {status}")
+    print(f"\n  - delta eval report:    {DELTA_DIR / 'delta_instruct_eval_report.json'}")
+    print(f"  - absolute eval report: {ABSOLUTE_DIR / 'absolute_instruct_eval_report.json'}")
+
+
+if __name__ == "__main__":
+    main()

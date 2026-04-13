@@ -30,6 +30,29 @@ OUTPUT_TRAIN_PATH = "./finetune_dataset_absolute_train.jsonl"
 OUTPUT_VAL_PATH = "./finetune_dataset_absolute_val.jsonl"
 OUTPUT_TEST_PATH = "./finetune_dataset_absolute_test.jsonl"
 
+# ── Instruct-style prompt ──
+INSTRUCT_PROMPT = True
+
+INSTRUCT_SYSTEM = (
+    "You are a motion prediction assistant that extrapolates future joint movements "
+    "based on observed absolute (x, y) coordinate sequences. "
+    "IMPORTANT: Provide EXACTLY 8 frames. Do not provide more or less."
+)
+INSTRUCT_TEMPLATE = (
+    "Forecast the next {pred_len:d} (x, y) absolute coordinates for all observed joints "
+    "using the given {obs_len:d} observed coordinate frames.\n"
+    "Each coordinate value must follow this token format: -[NUM][INT]000[SEP][DEC]00000[ENDNUM] "
+    "(minus sign optional).\n"
+    "Return one line in this exact format:\n"
+    "Next absolute coordinates: JOINT:(tok,tok),(tok,tok),... | JOINT:(tok,tok),...\n"
+    "### Observed Absolute Coordinate Sequences ###\n"
+    "{obs_text}"
+)
+
+OUTPUT_TRAIN_PATH_INSTRUCT = "./finetune_dataset_absolute_instruct_train.jsonl"
+OUTPUT_VAL_PATH_INSTRUCT = "./finetune_dataset_absolute_instruct_val.jsonl"
+OUTPUT_TEST_PATH_INSTRUCT = "./finetune_dataset_absolute_instruct_test.jsonl"
+
 # Robust scaling + optional clipping before tokenization (absolute coordinates)
 APPLY_ROBUST_SCALING = True
 SCALE_PERCENTILE = 95.0
@@ -197,9 +220,17 @@ def collect_samples(
                 if not obs_abs or not pred_abs:
                     continue
 
+                if INSTRUCT_PROMPT:
+                    body = INSTRUCT_TEMPLATE.format(
+                        pred_len=PRED_FRAMES, obs_len=OBS_FRAMES, obs_text=obs_abs
+                    )
+                    prompt_text = f"{INSTRUCT_SYSTEM}\n\n{body}"
+                else:
+                    prompt_text = f"Observed absolute coordinates: {obs_abs}"
+
                 samples.append(
                     {
-                        "prompt": f"Observed absolute coordinates: {obs_abs}",
+                        "prompt": prompt_text,
                         "completion": f"Next absolute coordinates: {pred_abs}",
                         "task": "trajectory_absolute",
                         "source_file": path.replace("\\", "/"),
@@ -261,17 +292,23 @@ def convert_all_to_absolute() -> None:
     samples = collect_samples(json_paths, joint_axis_scales=joint_axis_scales)
     train_rows, val_rows, test_rows = split_samples(samples)
 
-    write_jsonl(OUTPUT_TRAIN_PATH, train_rows)
-    write_jsonl(OUTPUT_VAL_PATH, val_rows)
-    write_jsonl(OUTPUT_TEST_PATH, test_rows)
+    t_path = OUTPUT_TRAIN_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_TRAIN_PATH
+    v_path = OUTPUT_VAL_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_VAL_PATH
+    e_path = OUTPUT_TEST_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_TEST_PATH
 
+    write_jsonl(t_path, train_rows)
+    write_jsonl(v_path, val_rows)
+    write_jsonl(e_path, test_rows)
+
+    prompt_mode = "instruct" if INSTRUCT_PROMPT else "plain"
     print(
         f"[DONE] total={len(samples)} | "
-        f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)}"
+        f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)} | "
+        f"prompt_mode={prompt_mode}"
     )
-    print(f" - train: {OUTPUT_TRAIN_PATH}")
-    print(f" - val  : {OUTPUT_VAL_PATH}")
-    print(f" - test : {OUTPUT_TEST_PATH}")
+    print(f" - train: {t_path}")
+    print(f" - val  : {v_path}")
+    print(f" - test : {e_path}")
 
 
 if __name__ == "__main__":

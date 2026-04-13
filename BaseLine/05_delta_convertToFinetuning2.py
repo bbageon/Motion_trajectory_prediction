@@ -25,6 +25,29 @@ OUTPUT_TRAIN_PATH = "./finetune_dataset_delta_train.jsonl"
 OUTPUT_VAL_PATH = "./finetune_dataset_delta_val.jsonl"
 OUTPUT_TEST_PATH = "./finetune_dataset_delta_test.jsonl"
 
+# ── Instruct-style prompt ──
+INSTRUCT_PROMPT = True
+
+INSTRUCT_SYSTEM = (
+    "You are a motion prediction assistant that extrapolates future joint movements "
+    "based on observed delta (dx, dy) coordinate sequences. "
+    "IMPORTANT: Provide EXACTLY 8 frames. Do not provide more or less."
+)
+INSTRUCT_TEMPLATE = (
+    "Forecast the next {pred_len:d} (x, y) coordinate deltas for all observed joints "
+    "using the given {obs_len:d} observed delta frames.\n"
+    "Each delta value must follow this token format: -[NUM][INT]000[SEP][DEC]00000[ENDNUM] "
+    "(minus sign optional).\n"
+    "Return one line in this exact format:\n"
+    "Next motion deltas: JOINT:(tok,tok),(tok,tok),... | JOINT:(tok,tok),...\n"
+    "### Observed Delta Sequences ###\n"
+    "{obs_text}"
+)
+
+OUTPUT_TRAIN_PATH_INSTRUCT = "./finetune_dataset_delta_instruct_train.jsonl"
+OUTPUT_VAL_PATH_INSTRUCT = "./finetune_dataset_delta_instruct_val.jsonl"
+OUTPUT_TEST_PATH_INSTRUCT = "./finetune_dataset_delta_instruct_test.jsonl"
+
 # Robust scaling + optional clipping before tokenization
 # 옵션 1: delta' = delta / (s + eps), 중심 이동 없이 0 유지
 # 옵션 2: delta' = clip(delta', -c, c)
@@ -192,9 +215,17 @@ def collect_samples(json_paths: list[str], joint_scales: dict[str, float] | None
                 if not obs_deltas or not pred_deltas:
                     continue
 
+                if INSTRUCT_PROMPT:
+                    body = INSTRUCT_TEMPLATE.format(
+                        pred_len=PRED_FRAMES, obs_len=OBS_FRAMES, obs_text=obs_deltas
+                    )
+                    prompt_text = f"{INSTRUCT_SYSTEM}\n\n{body}"
+                else:
+                    prompt_text = f"Observed motion deltas: {obs_deltas}"
+
                 samples.append(
                     {
-                        "prompt": f"Observed motion deltas: {obs_deltas}",
+                        "prompt": prompt_text,
                         "completion": f"Next motion deltas: {pred_deltas}",
                         "task": "trajectory_delta",
                         "source_file": path.replace("\\", "/"),
@@ -256,17 +287,23 @@ def convert_all_to_delta() -> None:
     samples = collect_samples(json_paths, joint_scales=joint_scales)
     train_rows, val_rows, test_rows = split_samples(samples)
 
-    write_jsonl(OUTPUT_TRAIN_PATH, train_rows)
-    write_jsonl(OUTPUT_VAL_PATH, val_rows)
-    write_jsonl(OUTPUT_TEST_PATH, test_rows)
+    t_path = OUTPUT_TRAIN_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_TRAIN_PATH
+    v_path = OUTPUT_VAL_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_VAL_PATH
+    e_path = OUTPUT_TEST_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_TEST_PATH
 
+    write_jsonl(t_path, train_rows)
+    write_jsonl(v_path, val_rows)
+    write_jsonl(e_path, test_rows)
+
+    prompt_mode = "instruct" if INSTRUCT_PROMPT else "plain"
     print(
         f"[DONE] total={len(samples)} | "
-        f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)}"
+        f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)} | "
+        f"prompt_mode={prompt_mode}"
     )
-    print(f" - train: {OUTPUT_TRAIN_PATH}")
-    print(f" - val  : {OUTPUT_VAL_PATH}")
-    print(f" - test : {OUTPUT_TEST_PATH}")
+    print(f" - train: {t_path}")
+    print(f" - val  : {v_path}")
+    print(f" - test : {e_path}")
 
 
 if __name__ == "__main__":

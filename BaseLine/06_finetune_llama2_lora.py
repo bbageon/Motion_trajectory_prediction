@@ -309,6 +309,22 @@ def find_lm_head_weight_parameter(model) -> Tuple[str, torch.nn.Parameter]:
     return candidates[0]
 
 
+def find_embed_weight_parameter(model) -> Tuple[str, torch.nn.Parameter]:
+    embed = model.get_input_embeddings()
+    if embed is not None and hasattr(embed, "weight") and isinstance(embed.weight, torch.nn.Parameter):
+        return "input_embeddings.weight", embed.weight
+
+    candidates: List[Tuple[str, torch.nn.Parameter]] = []
+    for name, param in model.named_parameters():
+        if "embed_tokens" in name and name.endswith("weight"):
+            candidates.append((name, param))
+    if not candidates:
+        raise RuntimeError("Could not find embed_tokens weight parameter.")
+
+    candidates.sort(key=lambda x: (not x[1].requires_grad, -x[1].numel()))
+    return candidates[0]
+
+
 def attach_row_grad_mask(param: torch.nn.Parameter, trainable_rows: List[int]) -> None:
     if param.ndim != 2:
         raise ValueError(f"Expected 2D weight matrix for row masking, got shape={tuple(param.shape)}")
@@ -378,11 +394,11 @@ def main() -> None:
     parser.add_argument(
         "--token-io-mode",
         choices=["full", "special_only", "lm_head_only", "lm_head_special_only", "off"],
-        default="full",
+        default="special_only",
         help=(
             "How to train token I/O layers: "
             "'full'=train full embed/lm_head, "
-            "'special_only'=train only added special token rows, "
+            "'special_only'=train only added special token rows in BOTH embed_tokens and lm_head, "
             "'lm_head_only'=train full lm_head only, "
             "'lm_head_special_only'=train only special token rows in lm_head, "
             "'off'=freeze token I/O."
@@ -428,19 +444,13 @@ def main() -> None:
     )
 
     modules_to_save = None
-    trainable_token_indices = None
-    ensure_weight_tying = False
     special_token_ids = resolve_trainable_special_token_ids(tokenizer)
     if args.token_io_mode == "full":
         modules_to_save = ["embed_tokens", "lm_head"]
-        ensure_weight_tying = True
     elif args.token_io_mode == "special_only":
-        trainable_token_indices = special_token_ids
-        ensure_weight_tying = bool(getattr(model.config, "tie_word_embeddings", False))
-        if not ensure_weight_tying:
-            print(
-                "[WARN] tie_word_embeddings=False; special_only mode updates input embedding rows only."
-            )
+        # embed_tokens + lm_head 모두 저장 대상으로 등록한 뒤,
+        # gradient mask로 special token 행만 학습되도록 제한.
+        modules_to_save = ["embed_tokens", "lm_head"]
     elif args.token_io_mode == "lm_head_only":
         modules_to_save = ["lm_head"]
     elif args.token_io_mode == "lm_head_special_only":
@@ -456,31 +466,38 @@ def main() -> None:
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
         "modules_to_save": modules_to_save,
     }
-    if trainable_token_indices is not None:
-        if "trainable_token_indices" not in lora_sig:
-            raise RuntimeError(
-                "Current peft version does not support trainable_token_indices. "
-                "Upgrade peft or use --token-io-mode full/off."
-            )
-        lora_kwargs["trainable_token_indices"] = trainable_token_indices
-    if ensure_weight_tying and "ensure_weight_tying" in lora_sig:
-        lora_kwargs["ensure_weight_tying"] = True
+    if args.token_io_mode == "full":
+        if "ensure_weight_tying" in lora_sig:
+            lora_kwargs["ensure_weight_tying"] = True
 
     lora_cfg = LoraConfig(**lora_kwargs)
     model = get_peft_model(model, lora_cfg)
-    if args.token_io_mode == "lm_head_special_only":
+
+    # ── gradient mask 적용 ──
+    if args.token_io_mode == "special_only":
+        embed_name, embed_weight = find_embed_weight_parameter(model)
+        attach_row_grad_mask(embed_weight, special_token_ids)
         lm_head_name, lm_head_weight = find_lm_head_weight_parameter(model)
         attach_row_grad_mask(lm_head_weight, special_token_ids)
         print(
-            "[INFO] lm_head special-row mask enabled: "
+            f"[INFO] special_only: gradient masks applied to BOTH layers, "
+            f"embed={embed_name}, lm_head={lm_head_name}, token_ids={special_token_ids}"
+        )
+    elif args.token_io_mode == "lm_head_special_only":
+        lm_head_name, lm_head_weight = find_lm_head_weight_parameter(model)
+        attach_row_grad_mask(lm_head_weight, special_token_ids)
+        print(
+            f"[INFO] lm_head special-row mask enabled: "
             f"module={lm_head_name}, token_ids={special_token_ids}"
         )
+
+    # ── 모드별 안내 출력 ──
     if args.token_io_mode == "off":
         print("[INFO] token io train disabled: embed_tokens/lm_head are frozen.")
     elif args.token_io_mode == "special_only":
         print(
             "[INFO] token io train mode=special_only: "
-            f"trainable token ids={trainable_token_indices}"
+            "special-token rows trained in BOTH embed_tokens and lm_head."
         )
     elif args.token_io_mode == "lm_head_only":
         print("[INFO] token io train mode=lm_head_only: lm_head full matrix will be updated.")
@@ -489,8 +506,8 @@ def main() -> None:
             "[INFO] token io train mode=lm_head_special_only: "
             "only special-token rows in lm_head get non-zero gradients."
         )
-    else:
-        print("[INFO] token io train enabled: embed_tokens/lm_head will be updated and saved.")
+    elif args.token_io_mode == "full":
+        print("[INFO] token io train mode=full: embed_tokens/lm_head will be fully updated and saved.")
     model.print_trainable_parameters()
 
     dataset = MotionJsonlDataset(args.train_jsonl, tokenizer, args.max_length)

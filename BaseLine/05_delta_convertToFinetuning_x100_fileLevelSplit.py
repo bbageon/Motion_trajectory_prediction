@@ -31,6 +31,29 @@ OUTPUT_TRAIN_PATH = "./x100 데이터/finetune_dataset_delta_x100_fileLevel_trai
 OUTPUT_VAL_PATH = "./x100 데이터/finetune_dataset_delta_x100_fileLevel_val.jsonl"
 OUTPUT_TEST_PATH = "./x100 데이터/finetune_dataset_delta_x100_fileLevel_test.jsonl"
 
+# ── Instruct-style prompt ──
+INSTRUCT_PROMPT = True
+
+INSTRUCT_SYSTEM = (
+    "You are a motion prediction assistant that extrapolates future joint movements "
+    "based on observed delta (dx, dy) coordinate sequences. "
+    "IMPORTANT: Provide EXACTLY 8 frames. Do not provide more or less."
+)
+INSTRUCT_TEMPLATE = (
+    "Forecast the next {pred_len:d} (x, y) coordinate deltas for all observed joints "
+    "using the given {obs_len:d} observed delta frames.\n"
+    "Each delta value must follow this token format: -[NUM][INT]000[SEP][DEC]00000[ENDNUM] "
+    "(minus sign optional).\n"
+    "Return one line in this exact format:\n"
+    "Next motion deltas: JOINT:(tok,tok),(tok,tok),... | JOINT:(tok,tok),...\n"
+    "### Observed Delta Sequences ###\n"
+    "{obs_text}"
+)
+
+OUTPUT_TRAIN_PATH_INSTRUCT = "./x100 데이터/finetune_dataset_delta_x100_instruct_fileLevel_train.jsonl"
+OUTPUT_VAL_PATH_INSTRUCT = "./x100 데이터/finetune_dataset_delta_x100_instruct_fileLevel_val.jsonl"
+OUTPUT_TEST_PATH_INSTRUCT = "./x100 데이터/finetune_dataset_delta_x100_instruct_fileLevel_test.jsonl"
+
 # ×100 선형 스케일: delta 값에 SCALE_FACTOR를 곱해 [INT] 토큰을 다양하게 만듦
 # Robust Scaling 미적용, 단순 선형 변환만 사용
 APPLY_ROBUST_SCALING = False
@@ -111,9 +134,18 @@ def collect_samples_by_file(json_paths: list[str]) -> dict[str, list[dict]]:
             pred_deltas = format_pose_sequence_deltas(pred)
             if not obs_deltas or not pred_deltas:
                 continue
+
+            if INSTRUCT_PROMPT:
+                body = INSTRUCT_TEMPLATE.format(
+                    pred_len=PRED_FRAMES, obs_len=OBS_FRAMES, obs_text=obs_deltas
+                )
+                prompt_text = f"{INSTRUCT_SYSTEM}\n\n{body}"
+            else:
+                prompt_text = f"Observed motion deltas: {obs_deltas}"
+
             rows.append(
                 {
-                    "prompt": f"Observed motion deltas: {obs_deltas}",
+                    "prompt": prompt_text,
                     "completion": f"Next motion deltas: {pred_deltas}",
                     "task": "trajectory_delta",
                     "source_file": source_file,
@@ -216,14 +248,20 @@ def convert_all_to_delta_x100_file_level() -> None:
     samples_by_file = collect_samples_by_file(json_paths)
     train_rows, val_rows, test_rows, split_files = split_by_file(samples_by_file)
 
-    write_jsonl(OUTPUT_TRAIN_PATH, train_rows)
-    write_jsonl(OUTPUT_VAL_PATH, val_rows)
-    write_jsonl(OUTPUT_TEST_PATH, test_rows)
+    t_path = OUTPUT_TRAIN_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_TRAIN_PATH
+    v_path = OUTPUT_VAL_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_VAL_PATH
+    e_path = OUTPUT_TEST_PATH_INSTRUCT if INSTRUCT_PROMPT else OUTPUT_TEST_PATH
+
+    write_jsonl(t_path, train_rows)
+    write_jsonl(v_path, val_rows)
+    write_jsonl(e_path, test_rows)
 
     total_samples = len(train_rows) + len(val_rows) + len(test_rows)
+    prompt_mode = "instruct" if INSTRUCT_PROMPT else "plain"
     print(
         f"[DONE:file-level] total_samples={total_samples} | "
-        f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)}"
+        f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)} | "
+        f"prompt_mode={prompt_mode}"
     )
     print(
         f"[FILES] train={len(split_files['train'])} "
@@ -232,9 +270,9 @@ def convert_all_to_delta_x100_file_level() -> None:
     print(f"[ACTIONS] train={action_counter(train_rows)}")
     print(f"[ACTIONS] val  ={action_counter(val_rows)}")
     print(f"[ACTIONS] test ={action_counter(test_rows)}")
-    print(f" - train: {OUTPUT_TRAIN_PATH}")
-    print(f" - val  : {OUTPUT_VAL_PATH}")
-    print(f" - test : {OUTPUT_TEST_PATH}")
+    print(f" - train: {t_path}")
+    print(f" - val  : {v_path}")
+    print(f" - test : {e_path}")
 
 
 if __name__ == "__main__":
